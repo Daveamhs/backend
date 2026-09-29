@@ -34,8 +34,9 @@ JWT_SECRET={{ JWT_SECRET }}        # resolved from the process environment
 DATABASE_URL={{ DATABASE_URL }}    # or an injected secrets provider
 ```
 
-- Resolution order: process environment → optional `secretsProvider` map
-  (integration point for Vault / AWS Secrets Manager / SOPS).
+- Resolution order: process environment → optional `secretsProvider` map.
+  Production Kubernetes uses External Secrets Operator with AWS Secrets
+  Manager; see the [secret rotation runbook](runbooks/secrets.md).
 - An unresolved reference is a **startup failure**, never a literal
   `{{ ... }}` string reaching the application.
 - Secret values are redacted as `[REDACTED]` in the config audit log and in

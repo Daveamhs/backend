@@ -6,7 +6,7 @@ services:
     container_name: dorisio-postgres
     environment:
       POSTGRES_USER: dorisio
-      POSTGRES_PASSWORD: dorisio_dev_password
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in your untracked .env file}
       POSTGRES_DB: dorisio
     ports:
       - '5432:5432'
@@ -38,11 +38,11 @@ services:
     container_name: dorisio-backend
     environment:
       NODE_ENV: development
-      DATABASE_URL: postgresql://dorisio:dorisio_dev_password@postgres:5432/dorisio
+      DATABASE_URL: postgresql://dorisio:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in your untracked .env file}@postgres:5432/dorisio
       REDIS_URL: redis://redis:6379
       PORT: 3000
       LOG_LEVEL: debug
-      JWT_SECRET: dev-secret-key-change-in-production
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in your untracked .env file}
       STELLAR_NETWORK: testnet
       STELLAR_HORIZON_URL: https://horizon-testnet.stellar.org
       STELLAR_SERVER_SECRET_KEY: ${STELLAR_SERVER_SECRET_KEY}
