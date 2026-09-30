@@ -2,6 +2,7 @@ import { PrismaClient } from '@prisma/client';
 import { BaseService } from '../../services/base.service';
 import { ValidationError } from '../../utils/errors';
 import { logger } from '../../utils/logger';
+import { WebhookService } from '../webhooks/webhook.service';
 
 export class VerificationService extends BaseService {
   constructor(private prisma: PrismaClient) {
@@ -24,6 +25,9 @@ export class VerificationService extends BaseService {
       });
 
       logger.info(`Creator verified: ${creatorId}`);
+      if (!creator.verified) {
+        await new WebhookService(this.prisma).dispatchEvent(creatorId, creatorId, 'creator.verified', { creatorId });
+      }
 
       return { verified: true };
     });

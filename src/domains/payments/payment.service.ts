@@ -1,4 +1,4 @@
-import { PrismaClient } from '@prisma/client';
+import { PrismaClient, Tip } from '@prisma/client';
 import { BaseService } from '../../services/base.service';
 import {
   CreateTipRequest,
@@ -12,7 +12,6 @@ import { ValidationError, NotFoundError, UnauthorizedError } from '../../utils/e
 import {
   buildPaymentTransaction,
   submitSignedTransaction,
-  checkTransactionStatus,
 } from '../../lib/stellar/transactions';
 import { logger } from '../../utils/logger';
 import { stellarConfirmationQueue } from '../../lib/queue';
@@ -22,6 +21,7 @@ import {
   parseSortParameters,
 } from '../../utils/pagination';
 import { paginateWithCursor } from '../../db/pagination';
+import { WebhookService } from '../webhooks/webhook.service';
 
 export class PaymentService extends BaseService {
   constructor(private prisma: PrismaClient) {
@@ -97,6 +97,9 @@ export class PaymentService extends BaseService {
       });
 
       logger.info(`Tip created: ${tip.id} from ${userId} to ${data.creatorId} for ${data.amount}`);
+      await new WebhookService(this.prisma).dispatchEvent(tip.creatorId, tip.id, 'tip.created', {
+        tipId: tip.id, amount: tip.amount, message: tip.message, status: tip.status,
+      });
       return this.formatTipResponse(tip);
     });
   }
@@ -153,7 +156,7 @@ export class PaymentService extends BaseService {
       const safePage = sanitizePageNumber(page);
       const safePageSize = sanitizePageSize(pageSize, 20);
 
-      const where: any = { creatorId };
+      const where: Record<string, unknown> = { creatorId };
       if (options.status) {
         where.status = options.status;
       }
@@ -216,12 +219,12 @@ export class PaymentService extends BaseService {
         throw new NotFoundError('Creator');
       }
 
-      const where: any = { creatorId };
+      const where: Record<string, unknown> = { creatorId };
       if (params.status) {
         where.status = params.status;
       }
 
-      const result = await paginateWithCursor(
+      const result = await paginateWithCursor<Tip>(
         this.prisma.tip,
         {
           limit: params.limit,
@@ -271,7 +274,7 @@ export class PaymentService extends BaseService {
       const safePage = sanitizePageNumber(page);
       const safePageSize = sanitizePageSize(pageSize, 20);
 
-      const where: any = { fromUserId: userId };
+      const where: Record<string, unknown> = { fromUserId: userId };
       if (options.status) {
         where.status = options.status;
       }
@@ -326,12 +329,12 @@ export class PaymentService extends BaseService {
     } = {}
   ) {
     return this.executeWithLogging('payment.getUserTipHistoryCursor', async () => {
-      const where: any = { fromUserId: userId };
+      const where: Record<string, unknown> = { fromUserId: userId };
       if (params.status) {
         where.status = params.status;
       }
 
-      const result = await paginateWithCursor(
+      const result = await paginateWithCursor<Tip>(
         this.prisma.tip,
         {
           limit: params.limit,
@@ -403,6 +406,9 @@ export class PaymentService extends BaseService {
         });
 
         logger.info(`Tip completed and creator earnings updated: ${tipId}, amount: ${tip.amount}`);
+        await new WebhookService(this.prisma).dispatchEvent(tip.creatorId, tip.id, 'payment.completed', {
+          tipId: tip.id, amount: tip.amount, transactionHash: tip.transactionHash,
+        });
       }
 
       return this.formatTipResponse(updatedTip);
@@ -457,13 +463,13 @@ export class PaymentService extends BaseService {
           memo: `tip-${tipId}`,
         });
 
-        const transaction = transactionBuilder.build();
-        const transactionEnvelope = transaction.toEnvelope().toXDR();
+        const transaction = transactionBuilder;
+        const transactionEnvelope = transaction.toXDR();
 
         logger.debug(`Payment transaction built for tip: ${tipId}`);
 
         return {
-          transactionEnvelope: transactionEnvelope as any as string,
+          transactionEnvelope: transactionEnvelope,
           tipId,
           fee: 100, // Base fee in stroops
         };
@@ -564,7 +570,7 @@ export class PaymentService extends BaseService {
   /**
    * Format database tip record to response DTO
    */
-  private formatTipResponse(tip: any): TipResponse {
+  private formatTipResponse(tip: { id: string; fromUserId: string; creatorId: string; amount: number; message: string | null; status: string; transactionHash?: string | null; createdAt: Date; updatedAt: Date }): TipResponse {
     return {
       id: tip.id,
       fromUserId: tip.fromUserId,

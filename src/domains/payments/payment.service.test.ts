@@ -1,3 +1,7 @@
+import type { PrismaClient } from '@prisma/client';
+vi.mock('../webhooks/webhook.service', () => ({ WebhookService: vi.fn(() => ({ dispatchEvent: publish })) }));
+const { publish } = vi.hoisted(() => ({ publish: vi.fn().mockResolvedValue(undefined) }));
+vi.mock('../../lib/queue', () => ({ stellarConfirmationQueue: { add: vi.fn() } }));
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { PaymentService } from './payment.service';
 import { ValidationError, NotFoundError } from '../../utils/errors';
@@ -27,7 +31,7 @@ describe('PaymentService', () => {
   let paymentService: PaymentService;
 
   beforeEach(() => {
-    paymentService = new PaymentService(mockPrisma as any);
+    paymentService = new PaymentService(mockPrisma as unknown as PrismaClient);
     vi.clearAllMocks();
   });
 
@@ -68,6 +72,7 @@ describe('PaymentService', () => {
         message: 'Great content!',
       });
 
+      expect(publish).toHaveBeenCalledWith(creatorId, 'tip-123', 'tip.created', expect.objectContaining({ amount: 100 }));
       expect(result.id).toBe('tip-123');
       expect(result.amount).toBe(100);
       expect(result.status).toBe('pending');
@@ -319,6 +324,7 @@ describe('PaymentService', () => {
 
       expect(result.status).toBe('completed');
       expect(mockPrisma.creator.update).toHaveBeenCalled();
+      expect(publish).toHaveBeenCalledWith(creatorId, tipId, 'payment.completed', expect.objectContaining({ amount: 100 }));
     });
 
     it('should throw NotFoundError if tip does not exist', async () => {

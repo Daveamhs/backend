@@ -100,7 +100,7 @@ model Webhook {
   creator   Creator  @relation(fields: [creatorId], references: [id], onDelete: Cascade)
   
   url       String
-  events    String[] // tip.created, tip.confirmed, tip.failed, payout.completed
+  events    String[] // Versioned event subscriptions, e.g. tip.created
   secret    String   // HMAC secret for signature verification
   active    Boolean  @default(true)
   
@@ -128,6 +128,7 @@ model WebhookEvent {
   
   @@index([webhookId])
   @@index([status])
+  @@index([createdAt])
 }
 
 model WalletFlag {

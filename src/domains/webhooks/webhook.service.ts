@@ -4,10 +4,11 @@ import { ValidationError, NotFoundError } from '../../utils/errors';
 import { webhookDispatchQueue } from '../../lib/queue';
 import { logger } from '../../utils/logger';
 import crypto from 'crypto';
+import { isWebhookEventType, WebhookEventEnvelope, WebhookEventType } from './webhook.events';
 
 export interface CreateWebhookRequest {
   url: string;
-  events: string[];
+  events: WebhookEventType[];
 }
 
 export interface WebhookResponse {
@@ -39,9 +40,8 @@ export class WebhookService extends BaseService {
       }
 
       // Validate events
-      const validEvents = ['tip.created', 'tip.confirmed', 'tip.failed', 'payout.completed'];
       for (const event of data.events) {
-        if (!validEvents.includes(event)) {
+        if (!isWebhookEventType(event)) {
           throw new ValidationError(`Invalid event type: ${event}`);
         }
       }
@@ -109,14 +109,26 @@ export class WebhookService extends BaseService {
   async dispatchEvent(
     creatorId: string,
     transactionId: string,
-    eventType: string,
-    payload: Record<string, unknown>
+    eventType: WebhookEventType,
+    payload: Record<string, unknown>,
+    webhookId?: string
   ): Promise<void> {
     return this.executeWithLogging('webhook.dispatch', async () => {
-      // Find active webhooks for this creator that subscribe to this event
+      if (!isWebhookEventType(eventType)) throw new ValidationError(`Invalid event type: ${eventType}`);
+      const eventId = crypto.randomUUID();
+      const event: WebhookEventEnvelope = {
+        id: eventId,
+        type: eventType,
+        version: '1',
+        createdAt: new Date().toISOString(),
+        data: { ...payload, transactionId },
+      };
+
+      // Filtering happens before work is placed on the delivery queue.
       const webhooks = await this.prisma.webhook.findMany({
         where: {
           creatorId,
+          ...(webhookId ? { id: webhookId } : {}),
           active: true,
           events: {
             has: eventType,
@@ -126,23 +138,46 @@ export class WebhookService extends BaseService {
 
       // Queue dispatch jobs for each webhook
       for (const webhook of webhooks) {
-        await webhookDispatchQueue.add(
-          'dispatch-event',
-          {
-            webhookId: webhook.id,
-            transactionId,
-            eventType,
-            payload,
-          },
-          {
-            attempts: 5,
-            backoff: { type: 'exponential', delay: 2000 },
-          }
-        );
+        const delivery = await this.prisma.webhookEvent.create({
+          data: { webhookId: webhook.id, eventType, payload: JSON.stringify(event), status: 'pending' },
+        });
+        try {
+          await webhookDispatchQueue.add(
+            'dispatch-event',
+            {
+              webhookId: webhook.id,
+              eventId: delivery.id,
+              eventType,
+              payload: event,
+            },
+            {
+              attempts: 5,
+              backoff: { type: 'exponential', delay: 2000 },
+              jobId: delivery.id,
+            }
+          );
+
+        } catch (error) {
+          // Keep the durable pending record available for recovery if enqueueing fails.
+          await this.prisma.webhookEvent.update({
+            where: { id: delivery.id },
+            data: { lastError: error instanceof Error ? error.message : String(error) },
+          });
+          throw error;
+        }
 
         logger.info(`Queued webhook dispatch for ${webhook.id} (event: ${eventType})`);
       }
     });
+  }
+
+  async testWebhook(webhookId: string, creatorId: string): Promise<void> {
+    const webhook = await this.prisma.webhook.findUnique({ where: { id: webhookId } });
+    if (!webhook || webhook.creatorId !== creatorId) throw new NotFoundError('Webhook');
+    if (!webhook.active) throw new ValidationError('Webhook is inactive');
+    const eventType = webhook.events.find(isWebhookEventType);
+    if (!eventType) throw new ValidationError('Webhook has no supported subscriptions');
+    await this.dispatchEvent(creatorId, `test-${crypto.randomUUID()}`, eventType, { test: true }, webhook.id);
   }
 
   /**
@@ -189,7 +224,7 @@ export class WebhookService extends BaseService {
       const safePageSize = sanitizePageSize(pageSize, 20);
       const skip = (safePage - 1) * safePageSize;
 
-      const where: any = { webhookId };
+      const where: { webhookId: string; status?: string } = { webhookId };
       if (status) {
         where.status = status;
       }
@@ -228,7 +263,7 @@ export class WebhookService extends BaseService {
     });
   }
 
-  private formatWebhookResponse(webhook: any): WebhookResponse {
+  private formatWebhookResponse(webhook: Omit<WebhookResponse, 'createdAt' | 'updatedAt'> & { createdAt: Date; updatedAt: Date }): WebhookResponse {
     return {
       id: webhook.id,
       creatorId: webhook.creatorId,

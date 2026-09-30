@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import { PrismaClient } from '@prisma/client';
 import { PaymentService } from '../../domains/payments/payment.service';
@@ -10,34 +11,29 @@ let userService: UserService;
 let payoutService: PayoutService;
 
 // Test data
+const createdUserIds: string[] = [];
 let testUserId: string;
 let testCreatorId: string;
 let testCreatorUserId: string;
-let isDbAvailable = false;
-
 const isDbAvailable = Boolean(process.env.DATABASE_URL);
 
 describe.skipIf(!isDbAvailable)('Tip Flow Integration Tests', () => {
   beforeAll(async () => {
-    try {
-      prisma = new PrismaClient();
-      await prisma.$connect();
-      paymentService = new PaymentService(prisma);
-      userService = new UserService(prisma);
-      payoutService = new PayoutService(prisma);
-    } catch {
-      console.warn('Database connection failed, skipping integration tests');
-    }
+    prisma = new PrismaClient();
+    await prisma.$connect();
+    paymentService = new PaymentService(prisma);
+    userService = new UserService(prisma);
+    payoutService = new PayoutService(prisma);
   });
 
   afterAll(async () => {
     if (!prisma) return;
     try {
       // Clean up test data
-      await prisma.tip.deleteMany({});
-      await prisma.wallet.deleteMany({});
-      await prisma.creator.deleteMany({});
-      await prisma.user.deleteMany({});
+      await prisma.tip.deleteMany({ where: { fromUserId: { in: createdUserIds } } });
+      await prisma.wallet.deleteMany({ where: { userId: { in: createdUserIds } } });
+      await prisma.creator.deleteMany({ where: { userId: { in: createdUserIds } } });
+      await prisma.user.deleteMany({ where: { id: { in: createdUserIds } } });
       await prisma.$disconnect();
     } catch {
       // ignore cleanup errors on disconnected DB
@@ -59,6 +55,7 @@ describe.skipIf(!isDbAvailable)('Tip Flow Integration Tests', () => {
       },
     });
     testUserId = fanUser.id;
+    createdUserIds.push(fanUser.id);
 
     const creatorUser = await prisma.user.create({
       data: {
@@ -69,26 +66,28 @@ describe.skipIf(!isDbAvailable)('Tip Flow Integration Tests', () => {
       },
     });
     testCreatorUserId = creatorUser.id;
+    createdUserIds.push(creatorUser.id);
 
-    // Create creator profile
+    // Create verified creator profile
     const creator = await prisma.creator.create({
       data: {
         userId: testCreatorUserId,
         username: `creator-${Date.now()}`,
         displayName: 'Test Creator',
         isPublic: true,
-      },
-    });
-    testCreatorId = creator.id;
-
-    // Link verified wallet to fan
-    await prisma.wallet.create({
-      data: {
-        userId: testUserId,
-        publicKey: `GBBD47AB2EB00E041B61C1B7AD184E687E24658D52EDFFDD118F5E6221D60E${Math.random().toString().slice(2, 4)}`,
         verified: true,
       },
     });
+
+testCreatorId = creator.id;
+        // Link verified wallet to fan
+        await prisma.wallet.create({
+          data: {
+            userId: testUserId,
+            publicKey: `TEST-${randomUUID()}`,
+            verified: true,
+          },
+        });
   });
 
   describe('Complete tip flow', () => {

@@ -1,4 +1,4 @@
-import { Queue, Worker, QueueEvents } from 'bullmq';
+import { Queue, QueueEvents } from 'bullmq';
 import { createClient } from 'redis';
 import { config } from '../config/env';
 import { logger } from '../utils/logger';
@@ -21,19 +21,33 @@ redis.connect().catch((err) => {
   logger.error('Failed to connect to Redis:', err);
 });
 
+// Let BullMQ create its own compatible Redis connections.
+const webhookRedisUrl = new URL(config.REDIS_URL);
+export const webhookConnection = {
+  host: webhookRedisUrl.hostname,
+  port: Number(webhookRedisUrl.port || 6379),
+  username: decodeURIComponent(webhookRedisUrl.username) || undefined,
+  password: decodeURIComponent(webhookRedisUrl.password) || undefined,
+  db: Number(webhookRedisUrl.pathname.slice(1) || 0),
+  ...(webhookRedisUrl.protocol === 'rediss:' ? { tls: {} } : {}),
+};
 // Job queues
 export const stellarConfirmationQueue = new Queue('stellar-confirmation', {
-  connection: redis as any,
+  connection: webhookConnection,
 });
-export const webhookDispatchQueue = new Queue('webhook-dispatch', { connection: redis as any });
+export const webhookDispatchQueue = new Queue('webhook-dispatch', {
+  connection: webhookConnection,
+  defaultJobOptions: { attempts: 5, backoff: { type: 'exponential', delay: 2000 } },
+});
+export const webhookDeadLetterQueue = new Queue('webhook-dead-letter', { connection: webhookConnection });
 
 // Queue event handlers
 export const stellarConfirmationEvents = new QueueEvents('stellar-confirmation', {
-  connection: redis as any,
+  connection: webhookConnection,
 });
 
 export const webhookDispatchEvents = new QueueEvents('webhook-dispatch', {
-  connection: redis as any,
+  connection: webhookConnection,
 });
 
 // Initialize queue event listeners
@@ -56,6 +70,7 @@ webhookDispatchEvents.on('failed', ({ jobId, failedReason }) => {
 export async function closeQueues() {
   await stellarConfirmationQueue.close();
   await webhookDispatchQueue.close();
+  await webhookDeadLetterQueue.close();
   await stellarConfirmationEvents.close();
   await webhookDispatchEvents.close();
   await redis.quit();

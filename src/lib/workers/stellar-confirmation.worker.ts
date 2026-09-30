@@ -1,12 +1,8 @@
 import { Worker, Job } from 'bullmq';
-import { createClient } from 'redis';
+import { webhookConnection } from '../queue';
 import { PrismaClient } from '@prisma/client';
-import { config } from '../../config/env';
 import { logger } from '../../utils/logger';
 
-const redis = createClient({
-  url: config.REDIS_URL,
-});
 
 const prisma = new PrismaClient();
 
@@ -39,7 +35,7 @@ export const stellarConfirmationWorker = new Worker(
     }
   },
   {
-    connection: redis as any,
+    connection: webhookConnection,
   }
 );
 
