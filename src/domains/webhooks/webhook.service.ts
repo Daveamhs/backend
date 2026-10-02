@@ -5,6 +5,36 @@ import { webhookDispatchQueue } from '../../lib/queue';
 import { logger } from '../../utils/logger';
 import crypto from 'crypto';
 import { isWebhookEventType, WebhookEventEnvelope, WebhookEventType } from './webhook.events';
+import { DEFAULT_PAGE_SIZE, sanitizePageNumber, sanitizePageSize } from '../../utils/pagination';
+
+/** Columns required to build a `WebhookResponse`. */
+const WEBHOOK_RESPONSE_SELECT = {
+  id: true,
+  creatorId: true,
+  url: true,
+  events: true,
+  secret: true,
+  active: true,
+  createdAt: true,
+  updatedAt: true,
+} as const;
+
+/** Columns required to build a delivery-history entry (payload excluded). */
+const WEBHOOK_EVENT_SELECT = {
+  id: true,
+  eventType: true,
+  status: true,
+  attempts: true,
+  lastError: true,
+  createdAt: true,
+  updatedAt: true,
+} as const;
+
+/**
+ * Upper bound on dispatch fan-out per event. Prevents a pathological
+ * subscription list from turning one transaction into thousands of queue jobs.
+ */
+const MAX_DISPATCH_TARGETS = 50;
 
 export interface CreateWebhookRequest {
   url: string;
@@ -65,16 +95,51 @@ export class WebhookService extends BaseService {
   }
 
   /**
-   * List webhooks for a creator
+   * List webhooks for a creator (paginated, newest first).
+   *
+   * Bounded so a creator with many endpoints can never pull an unbounded
+   * result set into the request path.
    */
-  async listWebhooks(creatorId: string): Promise<WebhookResponse[]> {
+  async listWebhooks(
+    creatorId: string,
+    page: number = 1,
+    pageSize: number = DEFAULT_PAGE_SIZE
+  ): Promise<{
+    webhooks: WebhookResponse[];
+    total: number;
+    page: number;
+    pageSize: number;
+    totalPages: number;
+    hasNext: boolean;
+    hasPrev: boolean;
+  }> {
     return this.executeWithLogging('webhook.list', async () => {
-      const webhooks = await this.prisma.webhook.findMany({
-        where: { creatorId },
-        orderBy: { createdAt: 'desc' },
-      });
+      const safePage = sanitizePageNumber(page);
+      const safePageSize = sanitizePageSize(pageSize, DEFAULT_PAGE_SIZE);
+      const where = { creatorId };
 
-      return webhooks.map((w) => this.formatWebhookResponse(w));
+      const [webhooks, total] = await Promise.all([
+        this.prisma.webhook.findMany({
+          where,
+          select: WEBHOOK_RESPONSE_SELECT,
+          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+          skip: (safePage - 1) * safePageSize,
+          take: safePageSize,
+        }),
+        this.prisma.webhook.count({ where }),
+      ]);
+
+      const totalPages = Math.ceil(total / safePageSize);
+
+      return {
+        webhooks: webhooks.map((w) => this.formatWebhookResponse(w)),
+        total,
+        page: safePage,
+        pageSize: safePageSize,
+        totalPages,
+        hasNext: safePage < totalPages,
+        hasPrev: safePage > 1,
+      };
     });
   }
 
@@ -85,6 +150,7 @@ export class WebhookService extends BaseService {
     return this.executeWithLogging('webhook.delete', async () => {
       const webhook = await this.prisma.webhook.findUnique({
         where: { id: webhookId },
+        select: { id: true, creatorId: true },
       });
 
       if (!webhook) {
@@ -114,8 +180,12 @@ export class WebhookService extends BaseService {
     webhookId?: string
   ): Promise<void> {
     return this.executeWithLogging('webhook.dispatch', async () => {
-      if (!isWebhookEventType(eventType)) throw new ValidationError(`Invalid event type: ${eventType}`);
+      if (!isWebhookEventType(eventType)) {
+        throw new ValidationError(`Invalid event type: ${eventType}`);
+      }
+
       const eventId = crypto.randomUUID();
+
       const event: WebhookEventEnvelope = {
         id: eventId,
         type: eventType,
@@ -124,6 +194,7 @@ export class WebhookService extends BaseService {
         data: { ...payload, transactionId },
       };
 
+      // Find active webhooks for this creator that subscribe to this event.
       // Filtering happens before work is placed on the delivery queue.
       const webhooks = await this.prisma.webhook.findMany({
         where: {
@@ -134,13 +205,23 @@ export class WebhookService extends BaseService {
             has: eventType,
           },
         },
+        select: { id: true, url: true },
+        take: MAX_DISPATCH_TARGETS,
+        orderBy: { createdAt: 'asc' },
       });
 
       // Queue dispatch jobs for each webhook
+      // Create a durable delivery record before queueing each webhook.
       for (const webhook of webhooks) {
         const delivery = await this.prisma.webhookEvent.create({
-          data: { webhookId: webhook.id, eventType, payload: JSON.stringify(event), status: 'pending' },
+          data: {
+            webhookId: webhook.id,
+            eventType,
+            payload: JSON.stringify(event),
+            status: 'pending',
+          },
         });
+
         try {
           await webhookDispatchQueue.add(
             'dispatch-event',
@@ -156,18 +237,20 @@ export class WebhookService extends BaseService {
               jobId: delivery.id,
             }
           );
-
         } catch (error) {
           // Keep the durable pending record available for recovery if enqueueing fails.
           await this.prisma.webhookEvent.update({
             where: { id: delivery.id },
-            data: { lastError: error instanceof Error ? error.message : String(error) },
+            data: {
+              lastError: error instanceof Error ? error.message : String(error),
+            },
           });
+
           throw error;
         }
-
-        logger.info(`Queued webhook dispatch for ${webhook.id} (event: ${eventType})`);
       }
+
+      logger.info({ creatorId, eventType, queued: webhooks.length }, 'Queued webhook dispatches');
     });
   }
 
@@ -177,7 +260,13 @@ export class WebhookService extends BaseService {
     if (!webhook.active) throw new ValidationError('Webhook is inactive');
     const eventType = webhook.events.find(isWebhookEventType);
     if (!eventType) throw new ValidationError('Webhook has no supported subscriptions');
-    await this.dispatchEvent(creatorId, `test-${crypto.randomUUID()}`, eventType, { test: true }, webhook.id);
+    await this.dispatchEvent(
+      creatorId,
+      `test-${crypto.randomUUID()}`,
+      eventType,
+      { test: true },
+      webhook.id
+    );
   }
 
   /**
@@ -210,10 +299,9 @@ export class WebhookService extends BaseService {
     hasPrev: boolean;
   }> {
     return this.executeWithLogging('webhook.history', async () => {
-      const { sanitizePageNumber, sanitizePageSize } = await import('../../utils/pagination');
-
       const webhook = await this.prisma.webhook.findUnique({
         where: { id: webhookId },
+        select: { id: true, creatorId: true },
       });
 
       if (!webhook || webhook.creatorId !== creatorId) {
@@ -221,7 +309,7 @@ export class WebhookService extends BaseService {
       }
 
       const safePage = sanitizePageNumber(page);
-      const safePageSize = sanitizePageSize(pageSize, 20);
+      const safePageSize = sanitizePageSize(pageSize, DEFAULT_PAGE_SIZE);
       const skip = (safePage - 1) * safePageSize;
 
       const where: { webhookId: string; status?: string } = { webhookId };
@@ -232,7 +320,8 @@ export class WebhookService extends BaseService {
       const [events, total] = await Promise.all([
         this.prisma.webhookEvent.findMany({
           where,
-          orderBy: { createdAt: 'desc' },
+          select: WEBHOOK_EVENT_SELECT,
+          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
           skip,
           take: safePageSize,
         }),
@@ -263,7 +352,9 @@ export class WebhookService extends BaseService {
     });
   }
 
-  private formatWebhookResponse(webhook: Omit<WebhookResponse, 'createdAt' | 'updatedAt'> & { createdAt: Date; updatedAt: Date }): WebhookResponse {
+  private formatWebhookResponse(
+    webhook: Omit<WebhookResponse, 'createdAt' | 'updatedAt'> & { createdAt: Date; updatedAt: Date }
+  ): WebhookResponse {
     return {
       id: webhook.id,
       creatorId: webhook.creatorId,

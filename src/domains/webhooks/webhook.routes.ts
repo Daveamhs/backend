@@ -65,6 +65,7 @@ export const registerWebhookRoutes = (app: FastifyInstance, prisma: PrismaClient
         // Get creator for this user
         const creator = await prisma.creator.findUnique({
           where: { userId: user.userId },
+          select: { id: true },
         });
 
         if (!creator) {
@@ -87,13 +88,23 @@ export const registerWebhookRoutes = (app: FastifyInstance, prisma: PrismaClient
     }
   );
 
-  // GET /api/v1/webhooks - List webhooks
-  app.get(
+  // GET /api/v1/webhooks - List webhooks (paginated, default 20 / max 100)
+  app.get<{
+    Querystring: { page?: string; pageSize?: string; limit?: string };
+  }>(
     '/api/v1/webhooks',
     {
       preHandler: authMiddleware,
       schema: {
-        description: 'Get all webhooks registered for the creator.',
+        description: 'Get webhooks registered for the creator (paginated, max 100 per page).',
+        querystring: {
+          type: 'object',
+          properties: {
+            page: { type: 'string', default: '1', description: 'Page number' },
+            pageSize: { type: 'string', default: '20', description: 'Items per page (max 100)' },
+            limit: { type: 'string', description: 'Alias for pageSize (max 100)' },
+          },
+        },
         response: {
           200: { type: 'object', additionalProperties: true, description: 'List of webhooks' },
           401: { type: 'object', additionalProperties: true, description: 'Unauthorized' },
@@ -107,6 +118,7 @@ export const registerWebhookRoutes = (app: FastifyInstance, prisma: PrismaClient
 
         const creator = await prisma.creator.findUnique({
           where: { userId: user.userId },
+          select: { id: true },
         });
 
         if (!creator) {
@@ -114,7 +126,16 @@ export const registerWebhookRoutes = (app: FastifyInstance, prisma: PrismaClient
           return;
         }
 
-        const result = await webhookService.listWebhooks(creator.id);
+        const query = (request.query ?? {}) as { page?: string; pageSize?: string; limit?: string };
+        const result = await webhookService.listWebhooks(
+          creator.id,
+          query.page ? parseInt(query.page, 10) : 1,
+          query.pageSize
+            ? parseInt(query.pageSize, 10)
+            : query.limit
+              ? parseInt(query.limit, 10)
+              : 20
+        );
         reply.send(formatSuccess(result));
       } catch (error) {
         if (error instanceof AppError) {
@@ -153,6 +174,7 @@ export const registerWebhookRoutes = (app: FastifyInstance, prisma: PrismaClient
 
         const creator = await prisma.creator.findUnique({
           where: { userId: user.userId },
+          select: { id: true },
         });
 
         if (!creator) {
@@ -214,6 +236,7 @@ export const registerWebhookRoutes = (app: FastifyInstance, prisma: PrismaClient
 
         const creator = await prisma.creator.findUnique({
           where: { userId: user.userId },
+          select: { id: true },
         });
 
         if (!creator) {

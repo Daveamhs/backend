@@ -8,55 +8,222 @@ datasource db {
 }
 
 model User {
-  id        String   @id @default(cuid())
-  email     String   @unique
-  password  String
-  name      String?
-  role      String   @default("fan")
-  verified  Boolean  @default(false)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id                      String   @id @default(cuid())
+  email                   String   @unique
+  password                String
+  name                    String?
+  bio                     String?
+  avatar                  String?
+  role                    String   @default("fan")
+  verified                Boolean  @default(false)
+  authVersion             Int      @default(0)
+  notificationPreferences Json     @default("{}")
+  createdAt               DateTime @default(now())
+  updatedAt               DateTime @updatedAt
 
-  creator   Creator?
-  wallets   Wallet[]
-  tips      Tip[]
+  creator             Creator?
+  wallets             Wallet[]
+  tips                Tip[]
+  payments            Payment[]
+  twoFactor           TwoFactorAuth?
+  trustedDevices      TrustedDevice[]
+  twoFactorEvents     TwoFactorEvent[]
+  userRoles           UserRole[]
+  passwordResetTokens PasswordResetToken[]
+}
+
+model TwoFactorAuth {
+  id          String   @id @default(cuid())
+  userId      String   @unique
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  secret      String
+  backupCodes String[]
+  enabled     Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model TrustedDevice {
+  id         String   @id @default(cuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash  String   @unique
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  lastUsedAt DateTime @default(now())
+
+  @@index([userId, expiresAt])
+}
+
+model TwoFactorEvent {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type      String
+  success   Boolean
+  ip        String?
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+}
+
+model Role {
+  id          String           @id @default(cuid())
+  name        String           @unique
+  description String?
+  hierarchy   Int              @default(0)
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+  permissions RolePermission[]
+  users       UserRole[]
+  changes     RoleChange[]
+}
+
+model Permission {
+  id          String           @id @default(cuid())
+  name        String           @unique
+  description String?
+  resource    String
+  action      String
+  roles       RolePermission[]
+  createdAt   DateTime         @default(now())
+}
+
+model RolePermission {
+  roleId       String
+  permissionId String
+  role         Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+  createdAt    DateTime   @default(now())
+
+  @@id([roleId, permissionId])
+}
+
+model UserRole {
+  userId     String
+  roleId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role       Role     @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  assignedAt DateTime @default(now())
+  assignedBy String?
+
+  @@id([userId, roleId])
+  @@index([roleId])
+}
+
+model RoleChange {
+  id        String   @id @default(cuid())
+  roleId    String?
+  role      Role?    @relation(fields: [roleId], references: [id], onDelete: SetNull)
+  actorId   String
+  targetId  String?
+  action    String
+  details   Json?
+  createdAt DateTime @default(now())
+
+  @@index([actorId, createdAt])
+  @@index([targetId, createdAt])
 }
 
 model Creator {
-  id        String   @id @default(cuid())
-  userId    String   @unique
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  id     String @id @default(cuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
 
-  username  String   @unique
+  username    String  @unique
   displayName String?
-  bio       String?
-  avatar    String?
-  
-  verified  Boolean  @default(false)
-  isPublic  Boolean  @default(true)
-  
-  totalEarnings Float @default(0)
+  bio         String?
+  avatar      String?
+
+  verified      Boolean   @default(false)
+  verifiedAt    DateTime?
+  verifiedUntil DateTime?
+  isPublic      Boolean   @default(true)
+
+  totalEarnings  Float @default(0)
   pendingBalance Float @default(0)
-  
-  tips      Tip[]    @relation("CreatorTips")
-  webhooks  Webhook[]
-  freezes   AccountFreeze[]
-  
+
+  tips                 Tip[]                        @relation("CreatorTips")
+  webhooks             Webhook[]
+  freezes              AccountFreeze[]
+  payments             Payment[]
+  payouts              Payout[]
+  verificationRequests CreatorVerificationRequest[]
+  verificationEvents   CreatorVerificationEvent[]
+
+  // Teams this creator belongs to (#66).
+  teamMemberships CreatorTeamMember[] @relation("CreatorTeamMembers")
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   @@index([verified, isPublic])
+  // Creator discovery feeds: visibility filter + deterministic keyset order.
+  @@index([isPublic, createdAt(sort: Desc), id(sort: Desc)], map: "idx_creator_public_createdAt")
+  // Leaderboard / "top creators" ordering after the visibility filter.
+  @@index([isPublic, verified, totalEarnings(sort: Desc)], map: "idx_creator_public_verified_earnings")
+  // Global top-earners ranking (no filters).
+  @@index([totalEarnings(sort: Desc)], map: "idx_creator_totalEarnings")
+}
+
+model CreatorVerificationRequest {
+  id           String                        @id @default(cuid())
+  creatorId    String
+  creator      Creator                       @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  status       String                        @default("submitted") // submitted | approved | rejected | expired
+  statement    String?
+  reviewerId   String?
+  reviewedAt   DateTime?
+  reviewReason String?
+  expiresAt    DateTime
+  createdAt    DateTime                      @default(now())
+  updatedAt    DateTime                      @updatedAt
+  documents    CreatorVerificationDocument[]
+  events       CreatorVerificationEvent[]
+
+  @@index([status, createdAt])
+  @@index([creatorId, createdAt])
+  @@index([expiresAt])
+}
+
+model CreatorVerificationDocument {
+  id          String                     @id @default(cuid())
+  requestId   String
+  request     CreatorVerificationRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  storageKey  String                     @unique
+  filename    String
+  contentType String
+  size        Int
+  createdAt   DateTime                   @default(now())
+
+  @@index([requestId])
+}
+
+model CreatorVerificationEvent {
+  id        String                      @id @default(cuid())
+  creatorId String
+  creator   Creator                     @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  requestId String?
+  request   CreatorVerificationRequest? @relation(fields: [requestId], references: [id], onDelete: SetNull)
+  actorId   String?
+  action    String // submitted | approved | rejected | expired | revoked
+  reason    String?
+  metadata  Json?
+  createdAt DateTime                    @default(now())
+
+  @@index([creatorId, createdAt])
+  @@index([requestId, createdAt])
 }
 
 model Wallet {
-  id        String   @id @default(cuid())
-  userId    String
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
 
-  publicKey String   @unique
+  publicKey String  @unique
   name      String?
-  verified  Boolean  @default(false)
-  
+  verified  Boolean @default(false)
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -64,25 +231,47 @@ model Wallet {
 }
 
 model Tip {
-  id        String   @id @default(cuid())
+  id         String @id @default(cuid())
   fromUserId String
-  fromUser   User     @relation(fields: [fromUserId], references: [id], onDelete: Cascade)
-  
+  fromUser   User   @relation(fields: [fromUserId], references: [id], onDelete: Cascade)
+
   creatorId String
-  creator   Creator  @relation("CreatorTips", fields: [creatorId], references: [id], onDelete: Cascade)
-  
-  amount    Float
-  message   String?
-  
-  status    String   @default("pending")
-  transactionHash String?
-  
+  creator   Creator @relation("CreatorTips", fields: [creatorId], references: [id], onDelete: Cascade)
+
+  amount  Float
+  message String?
+
+  status          String  @default("pending")
+  transactionHash String? @unique
+  // Optimistic locking guard: every status write must match the version it
+  // read and increments it, so concurrent confirmations cannot both succeed.
+  version         Int     @default(0)
+  // Client-supplied idempotency key for tip/payment submission; a retry
+  // returns the original tip instead of creating a duplicate charge.
+  idempotencyKey  String? @unique
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   @@index([creatorId, status, createdAt])
   @@index([fromUserId, createdAt])
   @@index([status])
+  // Unfiltered creator tip history ordered newest-first (keyset friendly).
+  @@index([creatorId, createdAt(sort: Desc), id(sort: Desc)], map: "idx_tip_creator_createdAt")
+  // User tip history filtered by status.
+  @@index([fromUserId, status, createdAt(sort: Desc)], map: "idx_tip_fromUser_status_createdAt")
+  // Global status sweeps (reconciliation workers) ordered by time.
+  @@index([status, createdAt], map: "idx_tip_status_createdAt")
+  // "Top supporters" aggregation: filter then group by supporter without a sort step.
+  @@index([creatorId, status, fromUserId], map: "idx_tip_creator_status_fromUser")
+  // Filtering / search (#56): one index per filter shape added to the listing
+  // and admin-search endpoints. See migration 20260927130000_tip_filter_indexes.
+  @@index([creatorId, amount], map: "idx_tip_creator_amount")
+  @@index([creatorId, createdAt], map: "idx_tip_creator_createdAt_range")
+  @@index([createdAt], map: "idx_tip_createdAt")
+  @@index([amount], map: "idx_tip_amount")
+  @@index([status, amount], map: "idx_tip_status_amount")
+  @@index([fromUserId, amount], map: "idx_tip_fromUser_amount")
 }
 
 model BlacklistedToken {
@@ -90,84 +279,567 @@ model BlacklistedToken {
   token     String   @unique
   expiresAt DateTime
   createdAt DateTime @default(now())
-  
+
   @@index([expiresAt])
+}
+
+// Tracks revoked/rotated refresh tokens by their JWT id (jti) so that a
+// leaked or already-used refresh token cannot be replayed.
+model BlacklistedRefreshToken {
+  id        String   @id @default(cuid())
+  jti       String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([expiresAt])
+}
+
+model VerificationToken {
+  id        String   @id @default(cuid())
+  email     String
+  token     String   @unique
+  userId    String?
+  expiresAt DateTime
+  used      Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([email])
+  @@index([token])
+  @@index([expiresAt])
+  @@index([userId])
+}
+
+model PasswordResetToken {
+  id        String   @id @default(cuid())
+  email     String
+  // SHA-256 digest of the one-time secret; the raw token is only emailed.
+  token     String   @unique
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  used      Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([email, createdAt])
+  @@index([expiresAt])
+  @@index([userId])
 }
 
 model Webhook {
-  id        String   @id @default(cuid())
+  id        String  @id @default(cuid())
   creatorId String
-  creator   Creator  @relation(fields: [creatorId], references: [id], onDelete: Cascade)
-  
+  creator   Creator @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+
   url       String
   events    String[] // Versioned event subscriptions, e.g. tip.created
-  secret    String   // HMAC secret for signature verification
+  secret    String // HMAC secret for signature verification
   active    Boolean  @default(true)
-  
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
-  
+
   webhookEvents WebhookEvent[]
-  
+
   @@index([creatorId])
+  // Webhook listing per creator, newest first.
+  @@index([creatorId, createdAt(sort: Desc)], map: "idx_webhook_creator_createdAt")
+  // Delivery worker only fans out to active endpoints.
+  @@index([creatorId, active, createdAt(sort: Desc)], map: "idx_webhook_creator_active_createdAt")
 }
 
 model WebhookEvent {
-  id        String   @id @default(cuid())
+  id        String  @id @default(cuid())
   webhookId String
-  webhook   Webhook  @relation(fields: [webhookId], references: [id], onDelete: Cascade)
-  
-  eventType String   // tip.created, tip.confirmed, etc.
-  payload   String   // JSON payload
-  status    String   @default("pending") // pending, delivered, failed
-  attempts  Int      @default(0)
+  webhook   Webhook @relation(fields: [webhookId], references: [id], onDelete: Cascade)
+
+  eventType String // tip.created, tip.confirmed, etc.
+  payload   String // JSON payload
+  status    String  @default("pending") // pending, delivered, failed
+  attempts  Int     @default(0)
   lastError String?
-  
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
-  
+
+  @@index([webhookId, status, createdAt(sort: Desc)])
   @@index([webhookId])
   @@index([status])
+  @@index([webhookId, status])
   @@index([createdAt])
+  // Delivery log listing per webhook, newest first.
+  @@index([webhookId, createdAt(sort: Desc)], map: "idx_webhookEvent_webhook_createdAt")
+  // Retry sweeps filter by status and process oldest events first.
+  @@index([status, createdAt], map: "idx_webhookEvent_status_createdAt")
+}
+
+// A payment processed by an external provider (Stripe et al). Raw card data is
+// never stored — only provider references and tokenized intent ids.
+model Payment {
+  id             String @id @default(cuid())
+  idempotencyKey String @unique
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  creatorId String?
+  creator   Creator? @relation(fields: [creatorId], references: [id], onDelete: SetNull)
+
+  provider    String // stripe
+  method      String // card | wallet | crypto
+  providerRef String? // provider payment intent reference
+  amount      Float
+  currency    String  @default("USD")
+  status      String  @default("pending") // pending, requires_action, processing, succeeded, failed, canceled, refunded, partially_refunded, disputed
+  description String?
+  metadata    Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  events  PaymentEvent[]
+  refunds Refund[]
+
+  @@index([userId, createdAt])
+  @@index([creatorId])
+  @@index([status])
+  @@index([providerRef])
+}
+
+// Immutable audit trail for a payment. Every state change and provider callback
+// appends an event so the full history can be reconstructed.
+model PaymentEvent {
+  id        String  @id @default(cuid())
+  paymentId String
+  payment   Payment @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+
+  type  String // payment.created, payment.succeeded, payment.failed, refund.created, chargeback.created, webhook.received
+  actor String? // user id, "system" or "provider"
+  data  Json?
+
+  // Provider event id — unique so webhook redelivery is idempotent.
+  providerEventId String? @unique
+
+  createdAt DateTime @default(now())
+
+  @@index([paymentId])
+  @@index([type])
+}
+
+// Append-only compliance trail. Application code never exposes update/delete
+// operations for this model; retention is performed by a dedicated sweep.
+model AuditLog {
+  id         String   @id @default(cuid())
+  userId     String?
+  action     String
+  resource   String
+  resourceId String?
+  changes    Json     @default("{}")
+  timestamp  DateTime @default(now())
+  ipAddress  String?
+  requestId  String?
+
+  @@index([resource, resourceId, timestamp])
+  @@index([userId, timestamp])
+  @@index([action, timestamp])
+  @@index([timestamp])
+}
+
+model Refund {
+  id             String  @id @default(cuid())
+  paymentId      String
+  payment        Payment @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+  idempotencyKey String  @unique
+
+  amount      Float
+  currency    String  @default("USD")
+  reason      String?
+  status      String  @default("pending") // pending, succeeded, failed
+  providerRef String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([paymentId])
+  @@index([status])
 }
 
 model WalletFlag {
-  id        String   @id @default(cuid())
-  address   String   @unique
-  
-  reason    String
-  severity  String   // low, medium, high, critical
-  notes     String?
-  
-  flaggedBy String
-  resolved  Boolean  @default(false)
+  id      String @id @default(cuid())
+  address String @unique
+
+  reason   String
+  severity String // low, medium, high, critical
+  notes    String?
+
+  flaggedBy  String
+  resolved   Boolean   @default(false)
   resolvedAt DateTime?
-  
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
-  
+
+  @@index([resolved, address])
+  @@index([resolved, createdAt(sort: Desc)])
   @@index([resolved])
   @@index([severity])
+  // Moderation queue: open flags ordered by severity then recency.
+  @@index([resolved, severity, createdAt(sort: Desc)], map: "idx_walletFlag_resolved_severity_createdAt")
 }
 
 model AccountFreeze {
-  id        String   @id @default(cuid())
+  id        String  @id @default(cuid())
   creatorId String
-  creator   Creator  @relation(fields: [creatorId], references: [id], onDelete: Cascade)
-  
+  creator   Creator @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+
   reason    String
   notes     String?
-  duration  Int?     // hours, null = indefinite
+  duration  Int? // hours, null = indefinite
   expiresAt DateTime?
-  
-  frozenBy  String
-  resolved  Boolean  @default(false)
+
+  frozenBy   String
+  resolved   Boolean   @default(false)
   resolvedAt DateTime?
-  
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
-  
+
+  @@index([creatorId, resolved, expiresAt])
   @@index([creatorId])
   @@index([resolved])
   @@index([expiresAt])
+  // Freeze history per creator: filter by resolution state, newest first.
+  @@index([creatorId, resolved, createdAt(sort: Desc)], map: "idx_accountFreeze_creator_resolved_createdAt")
+  // Expiry sweep: only active freezes, oldest expiry first.
+  @@index([resolved, expiresAt], map: "idx_accountFreeze_resolved_expiresAt")
+}
+
+enum PayoutStatus {
+  pending
+  processing
+  completed
+  failed
+}
+
+model Payout {
+  id        String  @id @default(cuid())
+  creatorId String
+  creator   Creator @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+
+  amount          Float
+  status          PayoutStatus @default(pending)
+  transactionHash String?      @unique
+  walletAddress   String
+
+  errorMessage String?
+  retryCount   Int       @default(0)
+  nextRetryAt  DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([creatorId, status])
+  @@index([status, nextRetryAt])
+  @@index([createdAt])
+  // Payout history per creator, newest first.
+  @@index([creatorId, createdAt(sort: Desc)], map: "idx_payout_creator_createdAt")
+  // Retry worker: failed payouts ordered by next retry time.
+  @@index([status, nextRetryAt], map: "idx_payout_status_nextRetryAt")
+  @@index([transactionHash])
+}
+
+// ---------------------------------------------------------------------------
+// Team / organization support (#66)
+//
+// A team groups creator accounts under a single organization: one verification,
+// one payout account, per-member revenue splits, contribution tracking and an
+// append-only audit trail of every membership change.
+// ---------------------------------------------------------------------------
+
+enum TeamRole {
+  owner
+  admin
+  member
+}
+
+enum TeamMemberStatus {
+  active
+  removed
+}
+
+enum TeamPayoutMode {
+  team
+  split
+}
+
+enum TeamPayoutStatus {
+  pending
+  processing
+  completed
+  failed
+}
+
+model CreatorTeam {
+  id          String  @id @default(cuid())
+  name        String
+  slug        String  @unique
+  description String?
+  avatar      String?
+
+  // One verification covers every member of the team.
+  verified         Boolean   @default(false)
+  verifiedAt       DateTime?
+  verificationNote String?
+
+  isPublic Boolean @default(true)
+
+  // Team payout account: a single destination wallet for collective revenue.
+  payoutWalletAddress  String?
+  payoutWalletVerified Boolean        @default(false)
+  payoutMode           TeamPayoutMode @default(team)
+  pendingBalance       Float          @default(0)
+  reservedBalance      Float          @default(0)
+  totalEarnings        Float          @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  members       CreatorTeamMember[]
+  splits        TeamRevenueSplit[]
+  contributions TeamContribution[]
+  distributions TeamRevenueDistribution[]
+  payouts       TeamPayout[]
+  auditLogs     TeamAuditLog[]
+
+  // Discovery feed: visibility filter, verified teams first, newest first.
+  @@index([isPublic, verified, createdAt(sort: Desc), id(sort: Desc)], map: "idx_creatorTeam_public_verified_createdAt")
+  // Collective leaderboard ordering.
+  @@index([totalEarnings(sort: Desc)], map: "idx_creatorTeam_totalEarnings")
+}
+
+// Membership of a creator inside a team, with their role and contribution
+// counters (kept denormalised so the team dashboard is a single round of reads).
+model CreatorTeamMember {
+  id String @id @default(cuid())
+
+  teamId String
+  team   CreatorTeam @relation(fields: [teamId], references: [id], onDelete: Cascade)
+
+  creatorId String
+  creator   Creator @relation("CreatorTeamMembers", fields: [creatorId], references: [id], onDelete: Cascade)
+
+  role   TeamRole         @default(member)
+  status TeamMemberStatus @default(active)
+
+  contributionCount  Int   @default(0)
+  contributionAmount Float @default(0)
+
+  joinedAt    DateTime  @default(now())
+  invitedById String?
+  removedAt   DateTime?
+  removedById String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  splits        TeamRevenueSplit[]
+  contributions TeamContribution[]
+  distributions TeamRevenueShare[]
+  payouts       TeamPayout[]
+
+  @@unique([teamId, creatorId], map: "uniq_creatorTeamMember_team_creator")
+  // Member rosters and "my teams" lookups both filter on the status.
+  @@index([teamId, status], map: "idx_creatorTeamMember_team_status")
+  @@index([creatorId, status], map: "idx_creatorTeamMember_creator_status")
+}
+
+// Configured revenue share for one member, in basis points (1 bps = 0.01%).
+model TeamRevenueSplit {
+  id String @id @default(cuid())
+
+  teamId String
+  team   CreatorTeam @relation(fields: [teamId], references: [id], onDelete: Cascade)
+
+  memberId String
+  member   CreatorTeamMember @relation(fields: [memberId], references: [id], onDelete: Cascade)
+
+  shareBps    Int
+  enabled     Boolean @default(true)
+  updatedById String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([teamId, memberId], map: "uniq_teamRevenueSplit_team_member")
+  @@index([teamId, enabled], map: "idx_teamRevenueSplit_team_enabled")
+}
+
+// A single contribution recorded by a team member (work, content, community...).
+model TeamContribution {
+  id String @id @default(cuid())
+
+  teamId String
+  team   CreatorTeam @relation(fields: [teamId], references: [id], onDelete: Cascade)
+
+  memberId String
+  member   CreatorTeamMember @relation(fields: [memberId], references: [id], onDelete: Cascade)
+
+  type        String // development | design | content | marketing | community | operations | manual
+  description String?
+  amount      Float   @default(0)
+  weight      Int     @default(1)
+  reference   String?
+
+  occurredAt   DateTime @default(now())
+  recordedById String?
+  createdAt    DateTime @default(now())
+
+  @@index([teamId, occurredAt(sort: Desc)], map: "idx_teamContribution_team_occurredAt")
+  @@index([teamId, type], map: "idx_teamContribution_team_type")
+  @@index([memberId, occurredAt(sort: Desc)], map: "idx_teamContribution_member_occurredAt")
+}
+
+// One revenue distribution event (tips, sponsorship, manual) and the shares it
+// produced. Distributions are immutable: a correction is a new distribution.
+model TeamRevenueDistribution {
+  id String @id @default(cuid())
+
+  teamId String
+  team   CreatorTeam @relation(fields: [teamId], references: [id], onDelete: Cascade)
+
+  amount    Float
+  currency  String  @default("XLM")
+  source    String  @default("manual")
+  reference String?
+  note      String?
+
+  distributedById String?
+  createdAt       DateTime @default(now())
+
+  shares TeamRevenueShare[]
+
+  @@index([teamId, createdAt(sort: Desc)], map: "idx_teamRevenueDistribution_team_createdAt")
+  @@index([source], map: "idx_teamRevenueDistribution_source")
+}
+
+// A member's slice of one distribution (amount already split and rounded).
+model TeamRevenueShare {
+  id String @id @default(cuid())
+
+  distributionId String
+  distribution   TeamRevenueDistribution @relation(fields: [distributionId], references: [id], onDelete: Cascade)
+
+  memberId String
+  member   CreatorTeamMember @relation(fields: [memberId], references: [id], onDelete: Cascade)
+
+  shareBps Int
+  amount   Float
+  // True when the member's own balance was credited (split payout mode).
+  credited Boolean @default(false)
+
+  createdAt DateTime @default(now())
+
+  @@index([distributionId], map: "idx_teamRevenueShare_distribution")
+  @@index([memberId, createdAt(sort: Desc)], map: "idx_teamRevenueShare_member_createdAt")
+}
+
+// A payout requested against the team's collective balance. The amount moves
+// from pendingBalance to reservedBalance while the payout is in flight.
+model TeamPayout {
+  id String @id @default(cuid())
+
+  teamId String
+  team   CreatorTeam @relation(fields: [teamId], references: [id], onDelete: Cascade)
+
+  amount          Float
+  status          TeamPayoutStatus @default(pending)
+  walletAddress   String
+  transactionHash String?          @unique
+  errorMessage    String?
+
+  requestedById String?
+  requestedBy   CreatorTeamMember? @relation(fields: [requestedById], references: [id], onDelete: SetNull)
+
+  processedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([teamId, status], map: "idx_teamPayout_team_status")
+  @@index([teamId, createdAt(sort: Desc)], map: "idx_teamPayout_team_createdAt")
+  @@index([status, createdAt], map: "idx_teamPayout_status_createdAt")
+}
+
+// Append-only audit trail: every team and membership change is logged here.
+model TeamAuditLog {
+  id String @id @default(cuid())
+
+  teamId String
+  team   CreatorTeam @relation(fields: [teamId], references: [id], onDelete: Cascade)
+
+  action          String // team.created, member.added, member.role_changed, revenue.distributed, ...
+  actorId         String?
+  actorUserId     String?
+  targetMemberId  String?
+  targetCreatorId String?
+  metadata        Json?
+
+  createdAt DateTime @default(now())
+
+  @@index([teamId, createdAt(sort: Desc)], map: "idx_teamAuditLog_team_createdAt")
+  @@index([teamId, action], map: "idx_teamAuditLog_team_action")
+}
+
+enum SubscriptionInterval {
+  DAILY
+  WEEKLY
+  MONTHLY
+  YEARLY
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  PAUSED
+  PAST_DUE
+  CANCELED
+}
+
+enum ChargeStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+}
+
+model Subscription {
+  id                 String               @id @default(uuid())
+  supporterId        String
+  creatorId          String
+  amount             Decimal              @db.Decimal(20, 7)
+  interval           SubscriptionInterval
+  status             SubscriptionStatus   @default(ACTIVE)
+  discountPercent    Int                  @default(0)
+  prorateFirst       Boolean              @default(false)
+  currentPeriodStart DateTime
+  nextChargeAt       DateTime
+  failedAttempts     Int                  @default(0)
+  canceledAt         DateTime?
+  createdAt          DateTime             @default(now())
+  updatedAt          DateTime             @updatedAt
+  charges            SubscriptionCharge[]
+
+  @@index([status, nextChargeAt])
+  @@index([creatorId])
+  @@index([supporterId])
+}
+
+model SubscriptionCharge {
+  id             String       @id @default(uuid())
+  subscriptionId String
+  subscription   Subscription @relation(fields: [subscriptionId], references: [id])
+  periodStart    DateTime
+  amount         Decimal      @db.Decimal(20, 7)
+  status         ChargeStatus @default(PENDING)
+  attempt        Int          @default(1)
+  tipId          String?
+  failureReason  String?
+  createdAt      DateTime     @default(now())
+
+  @@unique([subscriptionId, periodStart])
 }

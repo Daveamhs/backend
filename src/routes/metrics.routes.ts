@@ -2,6 +2,10 @@ import { FastifyInstance } from 'fastify';
 import { PrismaClient } from '@prisma/client';
 import { getMetricsText, updateMetrics } from '../lib/metrics';
 import { getPoolMetrics, getCircuitBreaker } from '../db';
+import { getPrismaPerformanceMonitor } from '../db/prisma-performance';
+import { getCircuitBreakerSnapshots, syncCircuitBreakerMetrics } from '../lib/circuit-breaker';
+import { registerRequestMetrics } from '../plugins/requestMetrics';
+import { registerRequestMetricsRoutes } from './requestMetrics.routes';
 
 export const registerMetricsRoute = (app: FastifyInstance, prisma: PrismaClient): void => {
   // GET /metrics - Prometheus metrics endpoint
@@ -19,9 +23,10 @@ export const registerMetricsRoute = (app: FastifyInstance, prisma: PrismaClient)
     },
     async (_request, reply) => {
       try {
-        // Update metrics from database
+        // Update metrics from database + external-service circuit breakers
         await updateMetrics(prisma);
         getPoolMetrics();
+        syncCircuitBreakerMetrics();
 
         const metrics = await getMetricsText();
         reply.type('text/plain; charset=utf-8').send(metrics);
@@ -51,6 +56,7 @@ export const registerMetricsRoute = (app: FastifyInstance, prisma: PrismaClient)
         await updateMetrics(prisma);
         const poolMetrics = getPoolMetrics();
         const cbMetrics = getCircuitBreaker().getMetrics();
+        const externalBreakers = getCircuitBreakerSnapshots();
 
         // Get current metric values
         const [pendingTips, confirmedTips, users, creators, totalEarnings] = await Promise.all([
@@ -80,6 +86,10 @@ export const registerMetricsRoute = (app: FastifyInstance, prisma: PrismaClient)
             waiting_clients: poolMetrics.waitingCount,
             circuit_breaker: cbMetrics,
           },
+          query_performance: getPrismaPerformanceMonitor().getStats(),
+          external_services: {
+            circuit_breakers: externalBreakers,
+          },
           application: {
             pending_tips: pendingTips,
             confirmed_tips: confirmedTips,
@@ -94,4 +104,10 @@ export const registerMetricsRoute = (app: FastifyInstance, prisma: PrismaClient)
       }
     }
   );
+
+  // Request logging + metrics collection (#54): the hook records every
+  // non-probe request into the in-process store (and the Prometheus
+  // histogram), and the admin routes expose the aggregated dashboard views.
+  registerRequestMetrics(app);
+  registerRequestMetricsRoutes(app);
 };

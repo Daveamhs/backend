@@ -8,20 +8,44 @@ import {
   BuildTransactionResponse,
   SubmitTransactionResponse,
 } from './payment.types';
-import { ValidationError, NotFoundError, UnauthorizedError } from '../../utils/errors';
 import {
-  buildPaymentTransaction,
-  submitSignedTransaction,
-} from '../../lib/stellar/transactions';
+  ValidationError,
+  NotFoundError,
+  UnauthorizedError,
+  ConflictError,
+} from '../../utils/errors';
+import { buildPaymentTransaction, submitSignedTransaction } from '../../lib/stellar/transactions';
 import { logger } from '../../utils/logger';
-import { stellarConfirmationQueue } from '../../lib/queue';
-import {
-  sanitizePageSize,
-  sanitizePageNumber,
-  parseSortParameters,
-} from '../../utils/pagination';
+import { sanitizePageSize, sanitizePageNumber, parseSortParameters } from '../../utils/pagination';
 import { paginateWithCursor } from '../../db/pagination';
 import { WebhookService } from '../webhooks/webhook.service';
+import { buildTipMemo, validateMemo, validatePaymentAmount } from '../../lib/stellar/validation';
+import { TipFilterInput, buildTipWhere, describeTipFilters } from './tip-filters';
+/**
+ * Columns required to build a TipResponse.
+ */
+const TIP_RESPONSE_SELECT = {
+  id: true,
+  fromUserId: true,
+  creatorId: true,
+  amount: true,
+  message: true,
+  status: true,
+  transactionHash: true,
+  createdAt: true,
+  updatedAt: true,
+} as const;
+function isUniqueConstraintError(error: unknown): boolean {
+  const code = (error as { code?: string })?.code;
+  return code === 'P2002';
+}
+
+class OptimisticLockError extends Error {
+  constructor(public readonly tipId: string) {
+    super(`Optimistic lock conflict for tip ${tipId}`);
+    this.name = 'OptimisticLockError';
+  }
+}
 
 export class PaymentService extends BaseService {
   constructor(private prisma: PrismaClient) {
@@ -37,15 +61,17 @@ export class PaymentService extends BaseService {
    */
   async createTip(userId: string, data: CreateTipRequest): Promise<TipResponse> {
     return this.executeWithLogging('payment.createTip', async () => {
-      // Validate amount
-      if (data.amount <= 0) {
-        throw new ValidationError('Amount must be greater than 0');
+      // Validate amount at the service boundary as well, so callers that bypass
+      // the route layer (jobs, internal tooling) cannot create bad records.
+      const amountCheck = validatePaymentAmount(data.amount);
+      if (!amountCheck.valid) {
+        throw new ValidationError(amountCheck.reason || 'Amount must be greater than 0');
       }
 
       // Verify creator exists, is public, and is verified
       const creator = await this.prisma.creator.findUnique({
         where: { id: data.creatorId },
-        include: { user: true },
+        select: { id: true, userId: true, isPublic: true, verified: true },
       });
 
       if (!creator) {
@@ -63,6 +89,7 @@ export class PaymentService extends BaseService {
       // Verify sender is not tipping themselves
       const sender = await this.prisma.user.findUnique({
         where: { id: userId },
+        select: { id: true },
       });
 
       if (!sender) {
@@ -79,26 +106,95 @@ export class PaymentService extends BaseService {
           userId,
           verified: true,
         },
+        select: { id: true, publicKey: true },
       });
 
       if (!wallet) {
         throw new ValidationError('User does not have a verified wallet');
       }
 
-      // Create tip in pending state
-      const tip = await this.prisma.tip.create({
-        data: {
-          fromUserId: userId,
-          creatorId: data.creatorId,
-          amount: data.amount,
-          message: data.message || null,
-          status: TipStatus.PENDING,
+      // #36 - Block payments from flagged wallets (medium/high/critical severity)
+      const walletFlag = await this.prisma.walletFlag.findFirst({
+        where: {
+          address: wallet.publicKey,
+          resolved: false,
+          severity: { in: ['medium', 'high', 'critical'] },
         },
+        select: { id: true },
       });
+
+      if (walletFlag) {
+        logger.warn(`Tip blocked: sender wallet ${wallet.publicKey} is flagged`);
+        throw new ValidationError('Payment cannot be processed at this time');
+      }
+
+      // #36 - Block payments to frozen creator accounts
+      const now = new Date();
+      const accountFreeze = await this.prisma.accountFreeze.findFirst({
+        where: {
+          creatorId: creator.id,
+          resolved: false,
+          OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
+        },
+        select: { id: true },
+      });
+
+      if (accountFreeze) {
+        logger.warn(`Tip blocked: creator account ${creator.id} is frozen`);
+        throw new ValidationError('Creator is not available for tips at this time');
+      }
+
+      // Idempotency: a retried submission that reuses its key must return the
+      // tip created by the first attempt instead of creating a second charge.
+      if (data.idempotencyKey) {
+        const existing = await this.prisma.tip.findUnique({
+          where: { idempotencyKey: data.idempotencyKey },
+        });
+        if (existing) {
+          if (existing.fromUserId !== userId) {
+            throw new ConflictError('Idempotency key already used by another user');
+          }
+          logger.info(`Idempotent tip creation replayed for key ${data.idempotencyKey}`);
+          return this.formatTipResponse(existing);
+        }
+      }
+
+      // Create tip in pending state
+      let tip;
+      try {
+        tip = await this.prisma.tip.create({
+          data: {
+            fromUserId: userId,
+            creatorId: data.creatorId,
+            amount: data.amount,
+            message: data.message || null,
+            status: TipStatus.PENDING,
+            idempotencyKey: data.idempotencyKey ?? null,
+          },
+        });
+      } catch (error) {
+        // Lost a concurrent create race on the same key: replay the winner.
+        if (data.idempotencyKey && isUniqueConstraintError(error)) {
+          const existing = await this.prisma.tip.findUnique({
+            where: { idempotencyKey: data.idempotencyKey },
+          });
+          if (existing) {
+            if (existing.fromUserId !== userId) {
+              throw new ConflictError('Idempotency key already used by another user');
+            }
+            logger.info(`Idempotent tip creation replayed for key ${data.idempotencyKey}`);
+            return this.formatTipResponse(existing);
+          }
+        }
+        throw error;
+      }
 
       logger.info(`Tip created: ${tip.id} from ${userId} to ${data.creatorId} for ${data.amount}`);
       await new WebhookService(this.prisma).dispatchEvent(tip.creatorId, tip.id, 'tip.created', {
-        tipId: tip.id, amount: tip.amount, message: tip.message, status: tip.status,
+        tipId: tip.id,
+        amount: tip.amount,
+        message: tip.message,
+        status: tip.status,
       });
       return this.formatTipResponse(tip);
     });
@@ -111,6 +207,7 @@ export class PaymentService extends BaseService {
     return this.executeWithLogging('payment.getTip', async () => {
       const tip = await this.prisma.tip.findUnique({
         where: { id: tipId },
+        select: TIP_RESPONSE_SELECT,
       });
 
       if (!tip) {
@@ -128,8 +225,7 @@ export class PaymentService extends BaseService {
     creatorId: string,
     page: number = 1,
     pageSize: number = 20,
-    options: {
-      status?: string;
+    options: TipFilterInput & {
       sortBy?: string;
       sortOrder?: 'asc' | 'desc';
     } = {}
@@ -141,6 +237,7 @@ export class PaymentService extends BaseService {
     totalPages: number;
     hasNext: boolean;
     hasPrev: boolean;
+    filters: Record<string, unknown>;
   }> {
     return this.executeWithLogging('payment.listTips', async () => {
       // Verify creator exists
@@ -156,10 +253,7 @@ export class PaymentService extends BaseService {
       const safePage = sanitizePageNumber(page);
       const safePageSize = sanitizePageSize(pageSize, 20);
 
-      const where: Record<string, unknown> = { creatorId };
-      if (options.status) {
-        where.status = options.status;
-      }
+      const where = buildTipWhere({ creatorId }, options);
 
       const sortFields = parseSortParameters(
         options.sortBy,
@@ -175,6 +269,7 @@ export class PaymentService extends BaseService {
       const [tips, total] = await Promise.all([
         this.prisma.tip.findMany({
           where,
+          select: TIP_RESPONSE_SELECT,
           skip,
           take: safePageSize,
           orderBy,
@@ -192,6 +287,7 @@ export class PaymentService extends BaseService {
         totalPages,
         hasNext: safePage < totalPages,
         hasPrev: safePage > 1,
+        filters: describeTipFilters(options),
       };
     });
   }
@@ -201,13 +297,12 @@ export class PaymentService extends BaseService {
    */
   async listTipsCursor(
     creatorId: string,
-    params: {
+    params: TipFilterInput & {
       limit?: number;
       cursor?: string;
       after?: string;
       sortBy?: string;
       sortOrder?: 'asc' | 'desc';
-      status?: string;
     } = {}
   ) {
     return this.executeWithLogging('payment.listTipsCursor', async () => {
@@ -219,10 +314,7 @@ export class PaymentService extends BaseService {
         throw new NotFoundError('Creator');
       }
 
-      const where: Record<string, unknown> = { creatorId };
-      if (params.status) {
-        where.status = params.status;
-      }
+      const where = buildTipWhere({ creatorId }, params);
 
       const result = await paginateWithCursor<Tip>(
         this.prisma.tip,
@@ -234,6 +326,7 @@ export class PaymentService extends BaseService {
         },
         {
           where,
+          select: TIP_RESPONSE_SELECT,
           allowedSortFields: ['createdAt', 'amount', 'status', 'id', 'updatedAt'],
           defaultSortField: 'createdAt',
           defaultSortDirection: 'desc',
@@ -244,6 +337,7 @@ export class PaymentService extends BaseService {
         ...result,
         items: result.items.map((tip) => this.formatTipResponse(tip)),
         data: result.data.map((tip) => this.formatTipResponse(tip)),
+        filters: describeTipFilters(params),
       };
     });
   }
@@ -255,8 +349,7 @@ export class PaymentService extends BaseService {
     userId: string,
     page: number = 1,
     pageSize: number = 20,
-    options: {
-      status?: string;
+    options: TipFilterInput & {
       sortBy?: string;
       sortOrder?: 'asc' | 'desc';
     } = {}
@@ -268,16 +361,14 @@ export class PaymentService extends BaseService {
     totalPages: number;
     hasNext: boolean;
     hasPrev: boolean;
+    filters: Record<string, unknown>;
   }> {
     return this.executeWithLogging('payment.getUserTipHistory', async () => {
       // Validate pagination
       const safePage = sanitizePageNumber(page);
       const safePageSize = sanitizePageSize(pageSize, 20);
 
-      const where: Record<string, unknown> = { fromUserId: userId };
-      if (options.status) {
-        where.status = options.status;
-      }
+      const where = buildTipWhere({ fromUserId: userId }, options);
 
       const sortFields = parseSortParameters(
         options.sortBy,
@@ -293,6 +384,7 @@ export class PaymentService extends BaseService {
       const [tips, total] = await Promise.all([
         this.prisma.tip.findMany({
           where,
+          select: TIP_RESPONSE_SELECT,
           skip,
           take: safePageSize,
           orderBy,
@@ -310,6 +402,7 @@ export class PaymentService extends BaseService {
         totalPages,
         hasNext: safePage < totalPages,
         hasPrev: safePage > 1,
+        filters: describeTipFilters(options),
       };
     });
   }
@@ -319,20 +412,16 @@ export class PaymentService extends BaseService {
    */
   async getUserTipHistoryCursor(
     userId: string,
-    params: {
+    params: TipFilterInput & {
       limit?: number;
       cursor?: string;
       after?: string;
       sortBy?: string;
       sortOrder?: 'asc' | 'desc';
-      status?: string;
     } = {}
   ) {
     return this.executeWithLogging('payment.getUserTipHistoryCursor', async () => {
-      const where: Record<string, unknown> = { fromUserId: userId };
-      if (params.status) {
-        where.status = params.status;
-      }
+      const where = buildTipWhere({ fromUserId: userId }, params);
 
       const result = await paginateWithCursor<Tip>(
         this.prisma.tip,
@@ -344,6 +433,7 @@ export class PaymentService extends BaseService {
         },
         {
           where,
+          select: TIP_RESPONSE_SELECT,
           allowedSortFields: ['createdAt', 'amount', 'status', 'id', 'updatedAt'],
           defaultSortField: 'createdAt',
           defaultSortDirection: 'desc',
@@ -354,6 +444,221 @@ export class PaymentService extends BaseService {
         ...result,
         items: result.items.map((tip) => this.formatTipResponse(tip)),
         data: result.data.map((tip) => this.formatTipResponse(tip)),
+        filters: describeTipFilters(params),
+      };
+    });
+  }
+
+  /**
+   * Cross-creator tip search for analytics and moderation (#56).
+   *
+   * Unlike the history and creator listings there is no implicit scope, so the
+   * caller supplies the filters explicitly (every one of them optional) and the
+   * result carries the applied filters back plus the total matching count, so a
+   * client can paginate without a second request. The route that exposes this
+   * is admin-only because it can read tips the caller does not own.
+   */
+  async searchTips(
+    page: number = 1,
+    pageSize: number = 20,
+    options: TipFilterInput & {
+      sortBy?: string;
+      sortOrder?: 'asc' | 'desc';
+    } = {}
+  ): Promise<{
+    tips: TipResponse[];
+    total: number;
+    page: number;
+    pageSize: number;
+    totalPages: number;
+    hasNext: boolean;
+    hasPrev: boolean;
+    filters: Record<string, unknown>;
+  }> {
+    return this.executeWithLogging('payment.searchTips', async () => {
+      const safePage = sanitizePageNumber(page);
+      const safePageSize = sanitizePageSize(pageSize, 20);
+
+      const where = buildTipWhere({}, options);
+
+      const sortFields = parseSortParameters(
+        options.sortBy,
+        options.sortOrder,
+        ['createdAt', 'amount', 'status', 'id', 'updatedAt'],
+        'createdAt',
+        'desc'
+      );
+
+      const orderBy = sortFields.map((s) => ({ [s.field]: s.direction }));
+      const skip = (safePage - 1) * safePageSize;
+
+      const [tips, total] = await Promise.all([
+        this.prisma.tip.findMany({
+          where,
+          select: TIP_RESPONSE_SELECT,
+          skip,
+          take: safePageSize,
+          orderBy,
+        }),
+        this.prisma.tip.count({ where }),
+      ]);
+
+      const totalPages = Math.ceil(total / safePageSize);
+
+      return {
+        tips: tips.map((tip) => this.formatTipResponse(tip)),
+        total,
+        page: safePage,
+        pageSize: safePageSize,
+        totalPages,
+        hasNext: safePage < totalPages,
+        hasPrev: safePage > 1,
+        filters: describeTipFilters(options),
+      };
+    });
+  }
+
+  /**
+   * List tips for a creator using cursor-based keyset pagination.
+   *
+   * Distinct from the `listTipsCursor` above, which is the offset/keyset hybrid
+   * consumed by the HTTP routes; this is the GraphQL-style connection shape.
+   */
+  async listTipsConnection(
+    creatorId: string,
+    params: { first?: number; after?: string; last?: number; before?: string } = {}
+  ): Promise<{
+    edges: Array<{ node: TipResponse; cursor: string }>;
+    pageInfo: {
+      hasNextPage: boolean;
+      hasPreviousPage: boolean;
+      startCursor: string | null;
+      endCursor: string | null;
+      totalCount?: number;
+    };
+    total?: number;
+  }> {
+    return this.executeWithLogging('payment.listTipsCursor', async () => {
+      const creator = await this.prisma.creator.findUnique({
+        where: { id: creatorId },
+      });
+
+      if (!creator) {
+        throw new NotFoundError('Creator');
+      }
+
+      const limit = params.first ?? params.last ?? 20;
+      if (limit < 1 || limit > 100) {
+        throw new ValidationError('Limit must be between 1 and 100');
+      }
+
+      let cursorObj: { id: string; createdAt: string } | undefined;
+      if (params.after) {
+        try {
+          const json = Buffer.from(params.after, 'base64url').toString('utf8');
+          cursorObj = JSON.parse(json);
+        } catch {
+          throw new ValidationError('Invalid pagination cursor');
+        }
+      }
+
+      const tips = await this.prisma.tip.findMany({
+        where: {
+          creatorId,
+        },
+        take: limit + 1,
+        ...(cursorObj ? { cursor: { id: cursorObj.id }, skip: 1 } : {}),
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      });
+
+      const hasMore = tips.length > limit;
+      const nodes = hasMore ? tips.slice(0, limit) : tips;
+
+      const edges = nodes.map((tip) => ({
+        node: this.formatTipResponse(tip),
+        cursor: Buffer.from(
+          JSON.stringify({ id: tip.id, createdAt: tip.createdAt.toISOString() }),
+          'utf8'
+        ).toString('base64url'),
+      }));
+
+      const startCursor = edges.length > 0 ? edges[0].cursor : null;
+      const endCursor = edges.length > 0 ? edges[edges.length - 1].cursor : null;
+
+      return {
+        edges,
+        pageInfo: {
+          hasNextPage: hasMore,
+          hasPreviousPage: Boolean(params.after),
+          startCursor,
+          endCursor,
+        },
+      };
+    });
+  }
+
+  /**
+   * List user tip history using cursor-based keyset pagination.
+   *
+   * Distinct from the `getUserTipHistoryCursor` above (offset/keyset hybrid used
+   * by the HTTP routes); this is the GraphQL-style connection shape.
+   */
+  async getUserTipHistoryConnection(
+    userId: string,
+    params: { first?: number; after?: string; last?: number; before?: string } = {}
+  ): Promise<{
+    edges: Array<{ node: TipResponse; cursor: string }>;
+    pageInfo: {
+      hasNextPage: boolean;
+      hasPreviousPage: boolean;
+      startCursor: string | null;
+      endCursor: string | null;
+    };
+  }> {
+    return this.executeWithLogging('payment.getUserTipHistoryCursor', async () => {
+      const limit = params.first ?? params.last ?? 20;
+      if (limit < 1 || limit > 100) {
+        throw new ValidationError('Limit must be between 1 and 100');
+      }
+
+      let cursorObj: { id: string; createdAt: string } | undefined;
+      if (params.after) {
+        try {
+          const json = Buffer.from(params.after, 'base64url').toString('utf8');
+          cursorObj = JSON.parse(json);
+        } catch {
+          throw new ValidationError('Invalid pagination cursor');
+        }
+      }
+
+      const tips = await this.prisma.tip.findMany({
+        where: {
+          fromUserId: userId,
+        },
+        take: limit + 1,
+        ...(cursorObj ? { cursor: { id: cursorObj.id }, skip: 1 } : {}),
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      });
+
+      const hasMore = tips.length > limit;
+      const nodes = hasMore ? tips.slice(0, limit) : tips;
+
+      const edges = nodes.map((tip) => ({
+        node: this.formatTipResponse(tip),
+        cursor: Buffer.from(
+          JSON.stringify({ id: tip.id, createdAt: tip.createdAt.toISOString() }),
+          'utf8'
+        ).toString('base64url'),
+      }));
+
+      return {
+        edges,
+        pageInfo: {
+          hasNextPage: hasMore,
+          hasPreviousPage: Boolean(params.after),
+          startCursor: edges.length > 0 ? edges[0].cursor : null,
+          endCursor: edges.length > 0 ? edges[edges.length - 1].cursor : null,
+        },
       };
     });
   }
@@ -364,54 +669,134 @@ export class PaymentService extends BaseService {
    */
   async updateTipStatus(tipId: string, data: UpdateTipStatusRequest): Promise<TipResponse> {
     return this.executeWithLogging('payment.updateTipStatus', async () => {
-      const tip = await this.prisma.tip.findUnique({
-        where: { id: tipId },
-      });
+      const maxRetries = 3;
+      let attempt = 0;
+      let shouldDispatchWebhook = false;
+      let finalTip: TipResponse | undefined;
 
-      if (!tip) {
-        throw new NotFoundError('Tip');
+      while (true) {
+        try {
+          finalTip = await this.prisma.$transaction(async (tx) => {
+            const tip = await tx.tip.findUnique({ where: { id: tipId } });
+            if (!tip) throw new NotFoundError('Tip');
+
+            // Already in the requested state: a concurrent worker got here first
+            // (or the client retried). A duplicate *confirmation* is a conflict;
+            // any other same-state call is an idempotent no-op.
+            if (tip.status === data.status) {
+              if (data.status === TipStatus.COMPLETED) {
+                logger.warn(
+                  { tipId, status: tip.status },
+                  'Duplicate tip confirmation rejected (already completed)'
+                );
+                throw new ConflictError('Tip has already been confirmed', {
+                  tipId,
+                  status: tip.status,
+                  hint: 'This tip was already processed; do not retry the confirmation.',
+                });
+              }
+              shouldDispatchWebhook = false;
+              return this.formatTipResponse(tip);
+            }
+
+            const validTransitions: Record<string, string[]> = {
+              [TipStatus.PENDING]: [TipStatus.COMPLETED, TipStatus.FAILED, TipStatus.CANCELLED],
+              [TipStatus.COMPLETED]: [],
+              [TipStatus.FAILED]: [TipStatus.PENDING],
+              [TipStatus.CANCELLED]: [],
+            };
+            if (!validTransitions[tip.status]?.includes(data.status)) {
+              logger.warn(
+                { tipId, from: tip.status, to: data.status },
+                'Unexpected tip status transition rejected'
+              );
+              throw new ConflictError(
+                `Cannot transition tip from ${tip.status} to ${data.status}`,
+                { tipId, from: tip.status, to: data.status }
+              );
+            }
+
+            // Optimistic lock: only the writer holding the version we just read
+            // may commit this transition. The loser gets count 0 and retries
+            // against fresh state, where it observes the winner's status.
+            const currentVersion = (tip as { version?: number }).version ?? 0;
+            const changed = await tx.tip.updateMany({
+              where: { id: tipId, status: tip.status, version: currentVersion },
+              data: { status: data.status, version: { increment: 1 } },
+            });
+            if (changed.count !== 1) {
+              throw new OptimisticLockError(tipId);
+            }
+
+            // Earnings are credited strictly inside the winning transition, so a
+            // single tip can increment creator earnings exactly once.
+            if (data.status === TipStatus.COMPLETED) {
+              await tx.creator.update({
+                where: { id: tip.creatorId },
+                data: {
+                  totalEarnings: { increment: tip.amount },
+                  pendingBalance: { increment: tip.amount },
+                },
+              });
+              logger.info(
+                `Tip completed and creator earnings updated: ${tipId}, amount: ${tip.amount}`
+              );
+              shouldDispatchWebhook = true;
+            } else {
+              shouldDispatchWebhook = false; // Reset in case of retry
+            }
+
+            return this.formatTipResponse({ ...tip, status: data.status });
+          });
+          break; // Exit retry loop on success
+        } catch (error: unknown) {
+          attempt++;
+          const code = (error as { code?: string })?.code;
+          const retryable =
+            error instanceof OptimisticLockError || code === 'P2028' || code === 'P2034';
+
+          if (retryable && attempt < maxRetries) {
+            logger.warn(
+              { tipId, attempt, maxRetries },
+              'Concurrent tip update detected; retrying with fresh state'
+            );
+            await new Promise((resolve) => setTimeout(resolve, 50 * Math.pow(2, attempt)));
+            continue;
+          }
+
+          if (error instanceof OptimisticLockError) {
+            throw new ConflictError('Tip was updated concurrently; reload and retry', {
+              tipId,
+              hint: 'Fetch the tip again and retry the transition with the current state.',
+            });
+          }
+          throw error;
+        }
       }
 
-      // Validate status transition
-      const validTransitions: Record<string, string[]> = {
-        [TipStatus.PENDING]: [TipStatus.COMPLETED, TipStatus.FAILED, TipStatus.CANCELLED],
-        [TipStatus.COMPLETED]: [],
-        [TipStatus.FAILED]: [TipStatus.PENDING], // Allow retry
-        [TipStatus.CANCELLED]: [],
-      };
-
-      if (!validTransitions[tip.status].includes(data.status)) {
-        throw new ValidationError(`Cannot transition from ${tip.status} to ${data.status}`);
+      if (!finalTip) {
+        throw new ConflictError('Tip update did not complete', { tipId });
       }
 
-      const updatedTip = await this.prisma.tip.update({
-        where: { id: tipId },
-        data: {
-          status: data.status,
-        },
-      });
-
-      // If tip is newly completed, update creator's earnings
-      if (data.status === TipStatus.COMPLETED && tip.status !== TipStatus.COMPLETED) {
-        await this.prisma.creator.update({
-          where: { id: tip.creatorId },
-          data: {
-            totalEarnings: {
-              increment: tip.amount,
-            },
-            pendingBalance: {
-              increment: tip.amount,
-            },
-          },
-        });
-
-        logger.info(`Tip completed and creator earnings updated: ${tipId}, amount: ${tip.amount}`);
-        await new WebhookService(this.prisma).dispatchEvent(tip.creatorId, tip.id, 'payment.completed', {
-          tipId: tip.id, amount: tip.amount, transactionHash: tip.transactionHash,
-        });
+      // Dispatch webhook outside the transaction only after a successful completion.
+      if (shouldDispatchWebhook) {
+        try {
+          await new WebhookService(this.prisma).dispatchEvent(
+            finalTip.creatorId,
+            finalTip.id,
+            'payment.completed',
+            {
+              tipId: finalTip.id,
+              amount: finalTip.amount,
+              transactionHash: finalTip.transactionHash,
+            }
+          );
+        } catch (error) {
+          logger.error({ error, tipId }, 'Failed to dispatch payment.completed webhook');
+        }
       }
 
-      return this.formatTipResponse(updatedTip);
+      return finalTip;
     });
   }
 
@@ -430,6 +815,7 @@ export class PaymentService extends BaseService {
     return this.executeWithLogging('payment.buildTransaction', async () => {
       const tip = await this.prisma.tip.findUnique({
         where: { id: tipId },
+        select: { id: true, fromUserId: true, status: true },
       });
 
       if (!tip) {
@@ -446,10 +832,19 @@ export class PaymentService extends BaseService {
           publicKey: senderPublicKey,
           verified: true,
         },
+        select: { id: true, userId: true },
       });
 
       if (!sender || sender.userId !== tip.fromUserId) {
         throw new UnauthorizedError('Wallet does not match tip sender');
+      }
+
+      // Stellar memos are capped at 28 bytes. Build (and verify) the memo before
+      // touching the network so we fail fast with a clear error.
+      const memo = buildTipMemo(tipId);
+      const memoCheck = validateMemo(memo);
+      if (!memoCheck.valid) {
+        throw new ValidationError(memoCheck.reason || 'Invalid transaction memo');
       }
 
       try {
@@ -460,7 +855,7 @@ export class PaymentService extends BaseService {
           amount,
           assetCode,
           assetIssuer,
-          memo: `tip-${tipId}`,
+          memo,
         });
 
         const transaction = transactionBuilder;
@@ -491,26 +886,52 @@ export class PaymentService extends BaseService {
     return this.executeWithLogging('payment.submitTransaction', async () => {
       const tip = await this.prisma.tip.findUnique({
         where: { id: tipId },
+        select: { id: true, status: true, transactionHash: true },
       });
 
       if (!tip) {
         throw new NotFoundError('Tip');
       }
 
+      // Idempotency: a tip that already carries a transaction hash was submitted
+      // before — return the stored result instead of submitting a second time.
+      if (tip.transactionHash) {
+        logger.warn(
+          { tipId, transactionHash: tip.transactionHash },
+          'Duplicate payment submission detected; returning existing transaction'
+        );
+        return {
+          tipId,
+          transactionHash: tip.transactionHash,
+          status: tip.status as TipResponse['status'],
+        };
+      }
+
       if (tip.status !== TipStatus.PENDING) {
-        throw new ValidationError('Can only submit transaction for pending tips');
+        throw new ConflictError('Can only submit transaction for pending tips', {
+          tipId,
+          status: tip.status,
+        });
+      }
+
+      // Submit transaction to Stellar network. This is the only non-transactional
+      // step; the unique transactionHash constraint below makes persistence
+      // idempotent if two submissions race.
+      let result: Awaited<ReturnType<typeof submitSignedTransaction>>;
+      try {
+        result = await submitSignedTransaction(transactionEnvelope);
+      } catch (error) {
+        logger.error(`Failed to submit transaction for tip ${tipId}:`, error);
+        throw new ValidationError('Failed to submit payment transaction');
       }
 
       try {
-        // Submit transaction to Stellar network
-        const result = await submitSignedTransaction(transactionEnvelope);
-
-        // Store transaction hash in tip
         const updatedTip = await this.prisma.tip.update({
           where: { id: tipId },
           data: {
             transactionHash: result.transactionHash,
           },
+          select: { status: true },
         });
 
         logger.info(
@@ -523,7 +944,27 @@ export class PaymentService extends BaseService {
           status: updatedTip.status as TipResponse['status'],
         };
       } catch (error) {
-        logger.error(`Failed to submit transaction for tip ${tipId}:`, error);
+        // Unique constraint on transactionHash: a concurrent submission already
+        // persisted this hash. Never overwrite it — replay the stored value.
+        if (isUniqueConstraintError(error)) {
+          const winner = await this.prisma.tip.findUnique({
+            where: { id: tipId },
+            select: { status: true, transactionHash: true },
+          });
+          if (winner?.transactionHash) {
+            logger.warn(
+              { tipId, transactionHash: winner.transactionHash },
+              'Concurrent payment submission lost the race; returning stored transaction'
+            );
+            return {
+              tipId,
+              transactionHash: winner.transactionHash,
+              status: winner.status as TipResponse['status'],
+            };
+          }
+          throw new ConflictError('Transaction has already been submitted for this tip', { tipId });
+        }
+        logger.error(`Failed to store transaction for tip ${tipId}:`, error);
         throw new ValidationError('Failed to submit payment transaction');
       }
     });
@@ -537,6 +978,7 @@ export class PaymentService extends BaseService {
     return this.executeWithLogging('payment.checkConfirmation', async () => {
       const tip = await this.prisma.tip.findUnique({
         where: { id: tipId },
+        select: TIP_RESPONSE_SELECT,
       });
 
       if (!tip) {
@@ -547,7 +989,10 @@ export class PaymentService extends BaseService {
         throw new ValidationError('No transaction hash found for this tip');
       }
 
-      // Queue the Stellar confirmation check as async job instead of blocking
+      // Queue the Stellar confirmation check as async job instead of blocking.
+      // Imported lazily so loading the payment service never opens a Redis
+      // connection as a side effect (keeps unit tests network-free).
+      const { stellarConfirmationQueue } = await import('../../lib/queue');
       await stellarConfirmationQueue.add(
         'confirm-transaction',
         {
@@ -570,7 +1015,17 @@ export class PaymentService extends BaseService {
   /**
    * Format database tip record to response DTO
    */
-  private formatTipResponse(tip: { id: string; fromUserId: string; creatorId: string; amount: number; message: string | null; status: string; transactionHash?: string | null; createdAt: Date; updatedAt: Date }): TipResponse {
+  private formatTipResponse(tip: {
+    id: string;
+    fromUserId: string;
+    creatorId: string;
+    amount: number;
+    message: string | null;
+    status: string;
+    transactionHash?: string | null;
+    createdAt: Date;
+    updatedAt: Date;
+  }): TipResponse {
     return {
       id: tip.id,
       fromUserId: tip.fromUserId,

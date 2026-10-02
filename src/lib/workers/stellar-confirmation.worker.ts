@@ -1,48 +1,92 @@
 import { Worker, Job } from 'bullmq';
-import { webhookConnection } from '../queue';
 import { PrismaClient } from '@prisma/client';
+import { bullConnection, backoffStrategy, moveToDeadLetter, QUEUE_NAMES } from '../queue';
+import { config } from '../../config/env';
 import { logger } from '../../utils/logger';
-
+import { checkTransactionStatus } from '../stellar/transactions';
+import { PaymentService } from '../../domains/payments/payment.service';
+import { TipStatus } from '../../domains/payments/payment.types';
 
 const prisma = new PrismaClient();
+const paymentService = new PaymentService(prisma);
 
-export const stellarConfirmationWorker = new Worker(
-  'stellar-confirmation',
-  async (job: Job) => {
-    const { tipId, transactionHash } = job.data;
+export function createStellarConfirmationWorker() {
+  const worker = new Worker(
+    QUEUE_NAMES.stellarConfirmation,
+    async (job: Job) => {
+      // payment.service passes { transactionId, transactionHash }
+      const tipId = job.data.tipId || job.data.transactionId;
+      const transactionHash = job.data.transactionHash;
 
-    logger.info(`Processing Stellar confirmation for tip ${tipId} (hash: ${transactionHash})`);
+      logger.info(`Processing Stellar confirmation for tip ${tipId} (hash: ${transactionHash})`);
 
-    try {
-      // Here you would check Stellar blockchain for confirmation
-      // For now, simulate with a simple check
-      logger.info(`Checking transaction ${transactionHash} on Stellar`);
+      await job.updateProgress(10);
 
-      // Update tip status to confirmed
-      await prisma.tip.update({
-        where: { id: tipId },
-        data: {
-          status: 'confirmed',
-          updatedAt: new Date(),
-        },
-      });
+      const status = await checkTransactionStatus(transactionHash);
 
-      logger.info(`Tip ${tipId} confirmed on Stellar`);
-      return { confirmed: true, tipId, transactionHash };
-    } catch (error) {
-      logger.error(`Error checking Stellar confirmation for ${tipId}:`, error);
-      throw error;
+      if (status.circuitOpen) {
+        logger.warn(`Circuit breaker open, delaying confirmation check for tip ${tipId}`);
+        throw new Error('Circuit breaker open');
+      }
+
+      if (status.confirmed) {
+        await job.updateProgress(50);
+
+        await paymentService.updateTipStatus(tipId, {
+          status: TipStatus.COMPLETED,
+        });
+
+        await job.updateProgress(100);
+
+        return {
+          confirmed: true,
+          tipId,
+          transactionHash,
+        };
+      }
+
+      logger.debug(`Transaction not confirmed yet for tip ${tipId}, will retry`);
+
+      throw new Error('Transaction not confirmed yet');
+    },
+    {
+      connection: bullConnection,
+      concurrency: config.WORKER_CONCURRENCY,
+      settings: {
+        backoffStrategy,
+      },
     }
-  },
-  {
-    connection: webhookConnection,
-  }
-);
+  );
 
-stellarConfirmationWorker.on('completed', (job) => {
-  logger.info(`Stellar confirmation worker completed job ${job.id}`);
-});
+  worker.on('completed', (job) => {
+    logger.info(`Stellar confirmation worker completed job ${job.id}`);
+  });
 
-stellarConfirmationWorker.on('failed', (job, err) => {
-  logger.error(`Stellar confirmation worker failed job ${job?.id}:`, err);
-});
+  worker.on('failed', async (job, error) => {
+    logger.error(`Stellar confirmation worker failed job ${job?.id}:`, error);
+
+    if (job && job.attemptsMade >= (job.opts.attempts ?? 5)) {
+      const tipId = job.data.tipId || job.data.transactionId;
+
+      try {
+        await paymentService.updateTipStatus(tipId, {
+          status: TipStatus.FAILED,
+        });
+      } catch (updateError) {
+        logger.error(`Failed to mark tip ${tipId} as FAILED:`, updateError);
+      }
+
+      await moveToDeadLetter(
+        QUEUE_NAMES.stellarConfirmation,
+        String(job.id),
+        job.data,
+        error.message
+      );
+    }
+  });
+
+  return worker;
+}
+
+/** @deprecated prefer createStellarConfirmationWorker() */
+export const stellarConfirmationWorker = createStellarConfirmationWorker();

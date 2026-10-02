@@ -4,15 +4,33 @@ import { AnalyticsService } from './analytics.service';
 import { formatSuccess, formatError } from '../../types/response';
 import { authMiddleware } from '../../middleware/auth';
 import { ValidationError, AppError, NotFoundError } from '../../utils/errors';
+import { enforceCreatorQuota, requireCreator } from '../../middleware/creator-tier';
+import type { CreatorTierRuntime } from '../creators/tier.runtime';
 
-export const registerAnalyticsRoutes = (app: FastifyInstance, prisma: PrismaClient): void => {
+export const registerAnalyticsRoutes = (
+  app: FastifyInstance,
+  prisma: PrismaClient,
+  /**
+   * Creator tier enforcement (#69). When provided, every analytics read spends
+   * the creator's tier quota and is throttled per plan instead of per IP.
+   */
+  tierRuntime?: CreatorTierRuntime
+): void => {
   const analyticsService = new AnalyticsService(prisma);
+
+  const creatorPreHandlers = tierRuntime
+    ? [
+        authMiddleware,
+        requireCreator(tierRuntime.middleware),
+        enforceCreatorQuota(tierRuntime.middleware),
+      ]
+    : [authMiddleware];
 
   // GET /api/v1/analytics/summary - Summary stats
   app.get(
     '/api/v1/analytics/summary',
     {
-      preHandler: authMiddleware,
+      preHandler: creatorPreHandlers,
       schema: {
 
         response: {
@@ -48,15 +66,11 @@ export const registerAnalyticsRoutes = (app: FastifyInstance, prisma: PrismaClie
   );
 
   // GET /api/v1/analytics/earnings - Earnings over time
-  app.get<{ Querystring: { days?: string } }>(
+  app.get<{ Querystring: { days?: string; granularity?: string } }>(
     '/api/v1/analytics/earnings',
     {
-      preHandler: authMiddleware,
+      preHandler: creatorPreHandlers,
       schema: {
-        
-        
-
-        
         querystring: {
           type: 'object',
           properties: {
@@ -64,6 +78,11 @@ export const registerAnalyticsRoutes = (app: FastifyInstance, prisma: PrismaClie
               type: 'string',
               default: '30',
 
+            },
+            granularity: {
+              type: 'string',
+              enum: ['daily', 'weekly', 'monthly'],
+              default: 'daily',
             },
           },
         },
@@ -87,15 +106,16 @@ export const registerAnalyticsRoutes = (app: FastifyInstance, prisma: PrismaClie
           return;
         }
 
-        const query = request.query as { days?: string };
+        const query = request.query as { days?: string; granularity?: string };
         const days = query.days ? parseInt(query.days) : 30;
+        const granularity = (query.granularity as 'daily' | 'weekly' | 'monthly') || 'daily';
 
         if (days < 1 || days > 365) {
           reply.code(400).send(formatError('Days must be between 1 and 365', 'INVALID_RANGE'));
           return;
         }
 
-        const result = await analyticsService.getEarningsOverTime(creator.id, days);
+        const result = await analyticsService.getEarningsOverTime(creator.id, days, granularity);
         reply.send(formatSuccess(result));
       } catch (error) {
         if (error instanceof AppError) {
@@ -111,7 +131,7 @@ export const registerAnalyticsRoutes = (app: FastifyInstance, prisma: PrismaClie
   app.get<{ Querystring: { limit?: string } }>(
     '/api/v1/analytics/supporters',
     {
-      preHandler: authMiddleware,
+      preHandler: creatorPreHandlers,
       schema: {
         
         
@@ -166,7 +186,7 @@ export const registerAnalyticsRoutes = (app: FastifyInstance, prisma: PrismaClie
   app.get<{ Querystring: { days?: string } }>(
     '/api/v1/analytics/frequency',
     {
-      preHandler: authMiddleware,
+      preHandler: creatorPreHandlers,
       schema: {
         
         

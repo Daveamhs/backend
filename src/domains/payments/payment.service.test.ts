@@ -1,5 +1,7 @@
 import type { PrismaClient } from '@prisma/client';
-vi.mock('../webhooks/webhook.service', () => ({ WebhookService: vi.fn(() => ({ dispatchEvent: publish })) }));
+vi.mock('../webhooks/webhook.service', () => ({
+  WebhookService: vi.fn(() => ({ dispatchEvent: publish })),
+}));
 const { publish } = vi.hoisted(() => ({ publish: vi.fn().mockResolvedValue(undefined) }));
 vi.mock('../../lib/queue', () => ({ stellarConfirmationQueue: { add: vi.fn() } }));
 import { describe, it, expect, beforeEach, vi } from 'vitest';
@@ -18,13 +20,21 @@ const mockPrisma = {
   wallet: {
     findFirst: vi.fn(),
   },
+  walletFlag: {
+    findFirst: vi.fn(),
+  },
+  accountFreeze: {
+    findFirst: vi.fn(),
+  },
   tip: {
     create: vi.fn(),
     findUnique: vi.fn(),
     findMany: vi.fn(),
     count: vi.fn(),
     update: vi.fn(),
+    updateMany: vi.fn(),
   },
+  $transaction: vi.fn((callback: (tx: any) => Promise<unknown>) => callback(mockPrisma)),
 };
 
 describe('PaymentService', () => {
@@ -52,8 +62,13 @@ describe('PaymentService', () => {
 
       mockPrisma.wallet.findFirst.mockResolvedValue({
         id: 'wallet-123',
+        publicKey: 'GCLEAN000',
         verified: true,
       });
+
+      // #36 — no active flags or freezes on the happy path
+      mockPrisma.walletFlag.findFirst.mockResolvedValue(null);
+      mockPrisma.accountFreeze.findFirst.mockResolvedValue(null);
 
       mockPrisma.tip.create.mockResolvedValue({
         id: 'tip-123',
@@ -72,7 +87,12 @@ describe('PaymentService', () => {
         message: 'Great content!',
       });
 
-      expect(publish).toHaveBeenCalledWith(creatorId, 'tip-123', 'tip.created', expect.objectContaining({ amount: 100 }));
+      expect(publish).toHaveBeenCalledWith(
+        creatorId,
+        'tip-123',
+        'tip.created',
+        expect.objectContaining({ amount: 100 })
+      );
       expect(result.id).toBe('tip-123');
       expect(result.amount).toBe(100);
       expect(result.status).toBe('pending');
@@ -140,6 +160,124 @@ describe('PaymentService', () => {
         })
       ).rejects.toThrow(ValidationError);
     });
+
+    // #36 — wallet flag and account freeze enforcement
+    it('should block a tip from a critically-flagged sender wallet', async () => {
+      const userId = 'user-flag';
+      const creatorId = 'creator-ok';
+
+      mockPrisma.user.findUnique.mockResolvedValue({ id: userId });
+      mockPrisma.creator.findUnique.mockResolvedValue({
+        id: creatorId,
+        userId: 'other-user',
+        isPublic: true,
+        verified: true,
+      });
+      mockPrisma.wallet.findFirst.mockResolvedValue({
+        id: 'wallet-flag',
+        publicKey: 'GFLAGGED111',
+        verified: true,
+      });
+      mockPrisma.walletFlag.findFirst.mockResolvedValue({ id: 'flag-1' });
+
+      await expect(paymentService.createTip(userId, { creatorId, amount: 50 })).rejects.toThrow(
+        ValidationError
+      );
+      expect(mockPrisma.tip.create).not.toHaveBeenCalled();
+    });
+
+    it('should allow a tip from a low-severity-flagged wallet', async () => {
+      const userId = 'user-lowflag';
+      const creatorId = 'creator-ok';
+
+      mockPrisma.user.findUnique.mockResolvedValue({ id: userId });
+      mockPrisma.creator.findUnique.mockResolvedValue({
+        id: creatorId,
+        userId: 'other-user',
+        isPublic: true,
+        verified: true,
+      });
+      mockPrisma.wallet.findFirst.mockResolvedValue({
+        id: 'wallet-low',
+        publicKey: 'GLOWFLAG222',
+        verified: true,
+      });
+      // low severity is excluded from the query — returns null
+      mockPrisma.walletFlag.findFirst.mockResolvedValue(null);
+      mockPrisma.accountFreeze.findFirst.mockResolvedValue(null);
+      mockPrisma.tip.create.mockResolvedValue({
+        id: 'tip-lowflag',
+        fromUserId: userId,
+        creatorId,
+        amount: 50,
+        message: null,
+        status: 'pending',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+      const result = await paymentService.createTip(userId, { creatorId, amount: 50 });
+      expect(result.id).toBe('tip-lowflag');
+    });
+
+    it('should block a tip to a frozen creator account', async () => {
+      const userId = 'user-ok';
+      const creatorId = 'creator-frozen';
+
+      mockPrisma.user.findUnique.mockResolvedValue({ id: userId });
+      mockPrisma.creator.findUnique.mockResolvedValue({
+        id: creatorId,
+        userId: 'other-user',
+        isPublic: true,
+        verified: true,
+      });
+      mockPrisma.wallet.findFirst.mockResolvedValue({
+        id: 'wallet-ok',
+        publicKey: 'GCLEAN999',
+        verified: true,
+      });
+      mockPrisma.walletFlag.findFirst.mockResolvedValue(null);
+      mockPrisma.accountFreeze.findFirst.mockResolvedValue({ id: 'freeze-1' });
+
+      await expect(paymentService.createTip(userId, { creatorId, amount: 100 })).rejects.toThrow(
+        ValidationError
+      );
+      expect(mockPrisma.tip.create).not.toHaveBeenCalled();
+    });
+
+    it('should allow a tip to a creator whose freeze has expired', async () => {
+      const userId = 'user-ok';
+      const creatorId = 'creator-expired-freeze';
+
+      mockPrisma.user.findUnique.mockResolvedValue({ id: userId });
+      mockPrisma.creator.findUnique.mockResolvedValue({
+        id: creatorId,
+        userId: 'other-user',
+        isPublic: true,
+        verified: true,
+      });
+      mockPrisma.wallet.findFirst.mockResolvedValue({
+        id: 'wallet-ok',
+        publicKey: 'GCLEAN888',
+        verified: true,
+      });
+      mockPrisma.walletFlag.findFirst.mockResolvedValue(null);
+      // expiresAt filter excludes the expired record — Prisma returns null
+      mockPrisma.accountFreeze.findFirst.mockResolvedValue(null);
+      mockPrisma.tip.create.mockResolvedValue({
+        id: 'tip-expired',
+        fromUserId: userId,
+        creatorId,
+        amount: 75,
+        message: null,
+        status: 'pending',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+      const result = await paymentService.createTip(userId, { creatorId, amount: 75 });
+      expect(result.id).toBe('tip-expired');
+    });
   });
 
   describe('getTip', () => {
@@ -163,6 +301,17 @@ describe('PaymentService', () => {
       expect(result.amount).toBe(100);
       expect(mockPrisma.tip.findUnique).toHaveBeenCalledWith({
         where: { id: tipId },
+        select: {
+          id: true,
+          fromUserId: true,
+          creatorId: true,
+          amount: true,
+          message: true,
+          status: true,
+          transactionHash: true,
+          createdAt: true,
+          updatedAt: true,
+        },
       });
     });
 
@@ -293,46 +442,6 @@ describe('PaymentService', () => {
     });
   });
 
-  describe('updateTipStatus', () => {
-    it('should update tip status and increment creator earnings', async () => {
-      const tipId = 'tip-123';
-      const creatorId = 'creator-123';
-
-      mockPrisma.tip.findUnique.mockResolvedValueOnce({
-        id: tipId,
-        creatorId,
-        amount: 100,
-        status: 'pending',
-      });
-
-      mockPrisma.tip.update.mockResolvedValue({
-        id: tipId,
-        creatorId,
-        amount: 100,
-        status: 'completed',
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      });
-
-      mockPrisma.creator.update.mockResolvedValue({
-        id: creatorId,
-        totalEarnings: 100,
-        pendingBalance: 100,
-      });
-
-      const result = await paymentService.updateTipStatus(tipId, { status: 'completed' });
-
-      expect(result.status).toBe('completed');
-      expect(mockPrisma.creator.update).toHaveBeenCalled();
-      expect(publish).toHaveBeenCalledWith(creatorId, tipId, 'payment.completed', expect.objectContaining({ amount: 100 }));
-    });
-
-    it('should throw NotFoundError if tip does not exist', async () => {
-      mockPrisma.tip.findUnique.mockResolvedValue(null);
-
-      await expect(
-        paymentService.updateTipStatus('non-existent', { status: 'completed' })
-      ).rejects.toThrow(NotFoundError);
-    });
-  });
+  // updateTipStatus optimistic-locking and concurrency coverage lives in
+  // ./__tests__/tip-concurrency.test.ts (issue #48).
 });

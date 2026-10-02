@@ -16,18 +16,39 @@ let testUserId: string;
 let testCreatorId: string;
 let testCreatorUserId: string;
 const isDbAvailable = Boolean(process.env.DATABASE_URL);
+/**
+ * `$connect()` resolves lazily in Prisma 5, so it cannot be used as a
+ * reachability probe — an unreachable database would only fail later, inside
+ * each test. A real `SELECT 1` is the only honest check.
+ */
+let dbReachable = false;
 
 describe.skipIf(!isDbAvailable)('Tip Flow Integration Tests', () => {
   beforeAll(async () => {
-    prisma = new PrismaClient();
-    await prisma.$connect();
-    paymentService = new PaymentService(prisma);
-    userService = new UserService(prisma);
-    payoutService = new PayoutService(prisma);
+    if (!isDbAvailable) {
+      console.warn('DATABASE_URL not set, skipping integration tests');
+      return;
+    }
+
+    try {
+      prisma = new PrismaClient();
+      await prisma.$queryRaw`SELECT 1`;
+      dbReachable = true;
+
+      paymentService = new PaymentService(prisma);
+      userService = new UserService(prisma);
+      payoutService = new PayoutService(prisma);
+    } catch {
+      console.warn('Database connection failed, skipping integration tests');
+    }
   });
 
   afterAll(async () => {
     if (!prisma) return;
+    if (!dbReachable) {
+      await prisma.$disconnect().catch(() => undefined);
+      return;
+    }
     try {
       // Clean up test data
       await prisma.tip.deleteMany({ where: { fromUserId: { in: createdUserIds } } });
@@ -41,7 +62,7 @@ describe.skipIf(!isDbAvailable)('Tip Flow Integration Tests', () => {
   });
 
   beforeEach(async (ctx) => {
-    if (!isDbAvailable) {
+    if (!dbReachable || !prisma) {
       ctx.skip();
       return;
     }
@@ -80,7 +101,8 @@ describe.skipIf(!isDbAvailable)('Tip Flow Integration Tests', () => {
     });
 
 testCreatorId = creator.id;
-        // Link verified wallet to fan
+
+// Link verified wallet to fan
         await prisma.wallet.create({
           data: {
             userId: testUserId,
