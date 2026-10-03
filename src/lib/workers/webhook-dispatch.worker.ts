@@ -6,6 +6,7 @@ import { config } from '../../config/env';
 import { logger } from '../../utils/logger';
 import { executeWithBreaker, CircuitBreakerOpenError } from '../circuit-breaker';
 import { createWebhookSignature } from '../../domains/webhooks/webhook.events';
+import { requestIdHeaders } from '../requestContext';
 
 const prisma = new PrismaClient();
 
@@ -54,7 +55,7 @@ export function createWebhookDispatchWorker() {
               'X-Dorisio-Event': eventType,
               'X-Dorisio-Delivery-Id': eventId,
               'X-Dorisio-Event-Version': '1',
-              'X-Request-Id': String(job.data.requestId ?? eventId ?? job.id),
+              ...requestIdHeaders(String(job.data.requestId ?? eventId ?? job.id)),
             },
             timeout: 10_000,
             maxRedirects: 0,

@@ -31,6 +31,7 @@ export const CreateTipSchema = z.object({
    * instead of creating (and charging for) a duplicate.
    */
   idempotencyKey: z.string().trim().min(8).max(255).optional(),
+  assetId: z.string().trim().min(1).max(100).optional(),
 });
 
 /**
@@ -83,6 +84,9 @@ export interface TipResponse {
   transactionHash: string | null;
   createdAt: string;
   updatedAt: string;
+  assetCode: string;
+  assetIssuer: string | null;
+  assetDecimals: number;
 }
 
 /**

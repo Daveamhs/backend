@@ -1,6 +1,6 @@
 import { PrismaClient } from '@prisma/client';
 import { BaseService } from '../../services/base.service';
-import { NotFoundError, UnauthorizedError } from '../../utils/errors';
+import { NotFoundError, UnauthorizedError, ValidationError } from '../../utils/errors';
 import { logger } from '../../utils/logger';
 
 export interface FlagWalletRequest {

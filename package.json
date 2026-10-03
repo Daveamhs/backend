@@ -26,7 +26,10 @@
     "db:migrate:dry-run": "tsx src/db/run-migrations.ts --dry-run",
     "db:rollback": "tsx src/db/run-migrations.ts --down",
     "worker": "tsx src/lib/workers/index.ts",
-    "jobs:status": "tsx src/lib/jobs/cli-status.ts"
+    "jobs:status": "tsx src/lib/jobs/cli-status.ts",
+    "quality:report": "tsx scripts/quality-report.ts",
+    "quality:check": "pnpm test -- --coverage && QUALITY_ENFORCE=true pnpm quality:report",
+    "verify-backup": "tsx scripts/verify-backup.ts"
   },
   "dependencies": {
     "@fastify/compress": "^8.0.0",
@@ -64,6 +67,7 @@
     "@types/graphql-depth-limit": "^1.1.6",
     "@types/jsonwebtoken": "^9.0.7",
     "@types/node": "^20.12.12",
+    "@vitest/coverage-v8": "^1.6.0",
     "@types/pg": "^8.11.6",
     "@typescript-eslint/eslint-plugin": "^7.11.0",
     "@typescript-eslint/parser": "^7.11.0",

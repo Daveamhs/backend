@@ -8,18 +8,20 @@ datasource db {
 }
 
 model User {
-  id                      String   @id @default(cuid())
-  email                   String   @unique
+  id                      String    @id @default(cuid())
+  email                   String    @unique
   password                String
   name                    String?
   bio                     String?
   avatar                  String?
-  role                    String   @default("fan")
-  verified                Boolean  @default(false)
-  authVersion             Int      @default(0)
-  notificationPreferences Json     @default("{}")
-  createdAt               DateTime @default(now())
-  updatedAt               DateTime @updatedAt
+  role                    String    @default("fan")
+  verified                Boolean   @default(false)
+  authVersion             Int       @default(0)
+  failedLoginAttempts     Int       @default(0)
+  lockedUntil             DateTime?
+  notificationPreferences Json      @default("{}")
+  createdAt               DateTime  @default(now())
+  updatedAt               DateTime  @updatedAt
 
   creator             Creator?
   wallets             Wallet[]
@@ -29,6 +31,7 @@ model User {
   trustedDevices      TrustedDevice[]
   twoFactorEvents     TwoFactorEvent[]
   userRoles           UserRole[]
+  sessions            Session[]
   passwordResetTokens PasswordResetToken[]
 }
 
@@ -140,9 +143,8 @@ model Creator {
   verifiedUntil DateTime?
   isPublic      Boolean   @default(true)
 
-  totalEarnings  Float @default(0)
-  pendingBalance Float @default(0)
-
+  totalEarnings        Float                        @default(0)
+  pendingBalance       Float                        @default(0)
   tips                 Tip[]                        @relation("CreatorTips")
   webhooks             Webhook[]
   freezes              AccountFreeze[]
@@ -154,8 +156,10 @@ model Creator {
   // Teams this creator belongs to (#66).
   teamMemberships CreatorTeamMember[] @relation("CreatorTeamMembers")
 
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  defaultAssetId String?
+  defaultAsset   StellarAsset? @relation("CreatorDefaultAsset", fields: [defaultAssetId], references: [id], onDelete: SetNull)
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
 
   @@index([verified, isPublic])
   // Creator discovery feeds: visibility filter + deterministic keyset order.
@@ -238,8 +242,13 @@ model Tip {
   creatorId String
   creator   Creator @relation("CreatorTips", fields: [creatorId], references: [id], onDelete: Cascade)
 
-  amount  Float
-  message String?
+  amount        Float
+  assetId       String?
+  asset         StellarAsset? @relation(fields: [assetId], references: [id], onDelete: SetNull)
+  assetCode     String        @default("USDC")
+  assetIssuer   String?
+  assetDecimals Int           @default(7)
+  message       String?
 
   status          String  @default("pending")
   transactionHash String? @unique
@@ -250,12 +259,18 @@ model Tip {
   // returns the original tip instead of creating a duplicate charge.
   idempotencyKey  String? @unique
 
+  // Moderation state (#62): read paths only serve 'visible' rows, an open report
+  // can hide content while it is reviewed, and a resolved decision can remove it.
+  moderationState String @default("visible") // visible, hidden, removed
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   @@index([creatorId, status, createdAt])
   @@index([fromUserId, createdAt])
   @@index([status])
+  // Public tip reads filter on the moderation state.
+  @@index([moderationState], map: "idx_tip_moderationState")
   // Unfiltered creator tip history ordered newest-first (keyset friendly).
   @@index([creatorId, createdAt(sort: Desc), id(sort: Desc)], map: "idx_tip_creator_createdAt")
   // User tip history filtered by status.
@@ -272,6 +287,56 @@ model Tip {
   @@index([amount], map: "idx_tip_amount")
   @@index([status, amount], map: "idx_tip_status_amount")
   @@index([fromUserId, amount], map: "idx_tip_fromUser_amount")
+  @@index([assetId, createdAt], map: "idx_tip_asset_createdAt")
+}
+
+model StellarAsset {
+  id        String   @id @default(cuid())
+  code      String
+  issuer    String?
+  name      String
+  decimals  Int      @default(7)
+  enabled   Boolean  @default(true)
+  priority  Int      @default(0)
+  feeBps    Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tips            Tip[]
+  defaultCreators Creator[] @relation("CreatorDefaultAsset")
+
+  @@unique([code, issuer], map: "uniq_stellarAsset_code_issuer")
+  @@index([enabled, priority], map: "idx_stellarAsset_enabled_priority")
+}
+
+model Session {
+  id           String    @id @default(cuid())
+  userId       String
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  token        String    @unique
+  device       String?
+  userAgent    String?
+  ipAddress    String?
+  lastActivity DateTime  @default(now())
+  expiresAt    DateTime
+  revokedAt    DateTime?
+  createdAt    DateTime  @default(now())
+
+  @@index([userId, revokedAt, expiresAt])
+  @@index([lastActivity])
+}
+
+model AuthAttempt {
+  id        String   @id @default(cuid())
+  email     String?
+  ipAddress String
+  action    String
+  success   Boolean  @default(false)
+  reason    String?
+  createdAt DateTime @default(now())
+
+  @@index([ipAddress, action, createdAt])
+  @@index([email, action, createdAt])
 }
 
 model BlacklistedToken {
@@ -330,20 +395,39 @@ model Webhook {
   creatorId String
   creator   Creator @relation(fields: [creatorId], references: [id], onDelete: Cascade)
 
-  url       String
-  events    String[] // Versioned event subscriptions, e.g. tip.created
-  secret    String // HMAC secret for signature verification
-  active    Boolean  @default(true)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  url             String
+  events          String[] // Versioned event subscriptions, e.g. tip.created
+  secret          String // HMAC secret for signature verification
+  previousSecret  String? // Previous secret during rotation period
+  secretRotatedAt DateTime? // When secret was last rotated
+  active          Boolean   @default(true)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
 
   webhookEvents WebhookEvent[]
+  webhookNonces WebhookNonce[]
 
   @@index([creatorId])
   // Webhook listing per creator, newest first.
   @@index([creatorId, createdAt(sort: Desc)], map: "idx_webhook_creator_createdAt")
   // Delivery worker only fans out to active endpoints.
   @@index([creatorId, active, createdAt(sort: Desc)], map: "idx_webhook_creator_active_createdAt")
+}
+
+model WebhookNonce {
+  id        String  @id @default(cuid())
+  webhookId String
+  webhook   Webhook @relation(fields: [webhookId], references: [id], onDelete: Cascade)
+
+  nonce     String   @unique // The nonce value from webhook request
+  timestamp BigInt // Unix timestamp of the webhook request
+  expiresAt DateTime // When this nonce can be cleaned up
+
+  createdAt DateTime @default(now())
+
+  @@index([webhookId, timestamp])
+  @@index([expiresAt]) // For cleanup of expired nonces
+  @@index([nonce]) // Fast lookup for replay detection
 }
 
 model WebhookEvent {
@@ -842,4 +926,90 @@ model SubscriptionCharge {
   createdAt      DateTime     @default(now())
 
   @@unique([subscriptionId, periodStart])
+}
+
+// An abuse report filed against a tip, a user or a creator. It is triaged
+// automatically, investigated by an admin and resolved with a recorded
+// decision; the resolution text and decision stay on the row forever.
+model Report {
+  id         String @id @default(cuid())
+  reporterId String
+
+  targetType String // tip, user, creator
+  targetId   String
+
+  reportType String // spam, harassment, inappropriate, fraud, copyright
+  reason     String
+  details    String?
+
+  status   String @default("reported") // reported, investigating, resolved, dismissed
+  decision String @default("none") // none, approved, denied
+
+  priority     String @default("normal") // low, normal, high, urgent
+  // Numeric mirror of `priority` so the queue can order by urgency in SQL
+  // instead of sorting in the application.
+  priorityRank Int    @default(2)
+
+  resolution String?
+  resolvedBy String?
+  resolvedAt DateTime?
+
+  // Moderator currently looking at it, so two admins do not duplicate the work.
+  assignedTo String?
+
+  // Automatic triage result (spam rules), kept so a decision can be explained.
+  autoFlagged Boolean @default(false)
+  spamScore   Int     @default(0)
+  spamSignals Json    @default("[]")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  appeals ReportAppeal[]
+
+  // Open queue: status filter, then urgency, then oldest first.
+  @@index([status, priorityRank, createdAt], map: "idx_report_status_priority_createdAt")
+  @@index([targetType, targetId], map: "idx_report_target")
+  @@index([reporterId, createdAt(sort: Desc)], map: "idx_report_reporter_createdAt")
+  @@index([reportType, status], map: "idx_report_reportedType_status")
+}
+
+// The author of the moderated content gets one appeal per report.
+model ReportAppeal {
+  id       String @id @default(cuid())
+  reportId String
+  report   Report @relation(fields: [reportId], references: [id], onDelete: Cascade)
+
+  appellantId String
+  message     String
+  status      String    @default("pending") // pending, accepted, rejected
+  notes       String?
+  reviewedBy  String?
+  reviewedAt  DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status, createdAt], map: "idx_reportAppeal_status_createdAt")
+}
+
+// Append-only moderation audit trail: who did what to which target, and why.
+model ModerationAction {
+  id       String  @id @default(cuid())
+  reportId String?
+
+  action String // report.created, report.auto_triaged, report.claimed, report.resolved, report.dismissed, content.hidden, content.restored, content.removed, appeal.filed, appeal.resolved
+
+  targetType String // tip, user, creator
+  targetId   String
+
+  actorId  String // user id, or "system" for automatic actions
+  reason   String?
+  metadata Json    @default("{}")
+
+  createdAt DateTime @default(now())
+
+  @@index([targetType, targetId, createdAt], map: "idx_moderationAction_target_createdAt")
+  @@index([reportId, createdAt], map: "idx_moderationAction_report_createdAt")
+  @@index([action, createdAt], map: "idx_moderationAction_action_createdAt")
 }

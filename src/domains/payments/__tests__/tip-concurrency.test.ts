@@ -27,6 +27,7 @@ const mockPrisma = {
   creator: { findUnique: vi.fn(), update: vi.fn() },
   user: { findUnique: vi.fn() },
   wallet: { findFirst: vi.fn() },
+  stellarAsset: { findFirst: vi.fn() },
   walletFlag: { findFirst: vi.fn() },
   accountFreeze: { findFirst: vi.fn() },
   webhook: { findMany: vi.fn() },
@@ -81,6 +82,13 @@ describe('createTip idempotency (#48)', () => {
     });
     mockPrisma.walletFlag.findFirst.mockResolvedValue(null);
     mockPrisma.accountFreeze.findFirst.mockResolvedValue(null);
+    mockPrisma.stellarAsset.findFirst.mockResolvedValue({
+      id: 'asset-usdc',
+      code: 'USDC',
+      issuer: 'GUSDCISSUER',
+      enabled: true,
+      priority: 100,
+    });
   });
 
   it('returns the original tip when an idempotency key is replayed', async () => {

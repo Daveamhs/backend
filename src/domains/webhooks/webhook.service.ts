@@ -3,8 +3,10 @@ import { BaseService } from '../../services/base.service';
 import { ValidationError, NotFoundError } from '../../utils/errors';
 import { webhookDispatchQueue } from '../../lib/queue';
 import { logger } from '../../utils/logger';
+import { getRequestId, withRequestIdPayload } from '../../lib/requestContext';
 import crypto from 'crypto';
 import { isWebhookEventType, WebhookEventEnvelope, WebhookEventType } from './webhook.events';
+import { AuditService } from '../../services/audit.service';
 import { DEFAULT_PAGE_SIZE, sanitizePageNumber, sanitizePageSize } from '../../utils/pagination';
 
 /** Columns required to build a `WebhookResponse`. */
@@ -53,8 +55,11 @@ export interface WebhookResponse {
 }
 
 export class WebhookService extends BaseService {
+  private auditService: AuditService;
+
   constructor(private prisma: PrismaClient) {
     super();
+    this.auditService = new AuditService(prisma.auditLog as any);
   }
 
   /**
@@ -229,7 +234,8 @@ export class WebhookService extends BaseService {
               webhookId: webhook.id,
               eventId: delivery.id,
               eventType,
-              payload: event,
+              requestId: getRequestId(),
+              payload: withRequestIdPayload(event),
             },
             {
               attempts: 5,
@@ -352,8 +358,98 @@ export class WebhookService extends BaseService {
     });
   }
 
+  async rotateWebhookSecret(
+    webhookId: string,
+    creatorId: string,
+    userId?: string,
+    ipAddress?: string
+  ): Promise<WebhookResponse> {
+    return this.executeWithLogging('webhook.rotateSecret', async () => {
+      const webhook = await this.prisma.webhook.findUnique({
+        where: { id: webhookId },
+        select: { id: true, creatorId: true, secret: true },
+      });
+
+      if (!webhook) {
+        throw new NotFoundError('Webhook');
+      }
+
+      if (webhook.creatorId !== creatorId) {
+        throw new ValidationError('Unauthorized');
+      }
+
+      // Generate new secret
+      const newSecret = crypto.randomBytes(32).toString('hex');
+
+      // Update webhook: move current secret to previousSecret, set new secret
+      const updated = await this.prisma.webhook.update({
+        where: { id: webhookId },
+        data: {
+          previousSecret: webhook.secret,
+          secret: newSecret,
+          secretRotatedAt: new Date(),
+        },
+        select: WEBHOOK_RESPONSE_SELECT,
+      });
+
+      // Audit log the secret rotation
+      await this.auditService.record({
+        userId,
+        action: 'webhook.secret_rotated',
+        resource: 'webhook',
+        resourceId: webhookId,
+        ipAddress,
+        changes: {
+          secretRotatedAt: {
+            old: null,
+            new: updated.secretRotatedAt,
+          },
+        },
+      });
+
+      logger.info({ webhookId, creatorId, userId }, 'Webhook secret rotated successfully');
+
+      return this.formatWebhookResponse(updated);
+    });
+  }
+
+  /**
+   * Clear previous secret after rotation grace period
+   *
+   * This should be called after the grace period (e.g., 7 days) to remove the old secret.
+   * Can be run manually or as a scheduled job.
+   */
+  async clearExpiredPreviousSecrets(): Promise<number> {
+    return this.executeWithLogging('webhook.clearExpiredSecrets', async () => {
+      const gracePeriodDays = 7;
+      const expirationDate = new Date();
+      expirationDate.setDate(expirationDate.getDate() - gracePeriodDays);
+
+      const result = await this.prisma.webhook.updateMany({
+        where: {
+          previousSecret: {
+            not: null,
+          },
+          secretRotatedAt: {
+            lt: expirationDate,
+          },
+        },
+        data: {
+          previousSecret: null,
+        },
+      });
+
+      logger.info({ count: result.count }, 'Cleared expired previous secrets');
+
+      return result.count;
+    });
+  }
+
   private formatWebhookResponse(
-    webhook: Omit<WebhookResponse, 'createdAt' | 'updatedAt'> & { createdAt: Date; updatedAt: Date }
+    webhook: Omit<WebhookResponse, 'createdAt' | 'updatedAt'> & {
+      createdAt: Date;
+      updatedAt: Date;
+    }
   ): WebhookResponse {
     return {
       id: webhook.id,

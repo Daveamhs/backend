@@ -20,6 +20,9 @@ const mockPrisma = {
   wallet: {
     findFirst: vi.fn(),
   },
+  stellarAsset: {
+    findFirst: vi.fn(),
+  },
   walletFlag: {
     findFirst: vi.fn(),
   },
@@ -43,6 +46,15 @@ describe('PaymentService', () => {
   beforeEach(() => {
     paymentService = new PaymentService(mockPrisma as unknown as PrismaClient);
     vi.clearAllMocks();
+
+    mockPrisma.stellarAsset.findFirst.mockResolvedValue({
+      id: 'asset-usdc',
+      code: 'USDC',
+      issuer: 'GUSDCISSUER',
+      decimals: 7,
+      enabled: true,
+      priority: 100,
+    });
   });
 
   describe('createTip', () => {
@@ -309,6 +321,10 @@ describe('PaymentService', () => {
           message: true,
           status: true,
           transactionHash: true,
+          assetCode: true,
+          assetIssuer: true,
+          assetDecimals: true,
+          moderationState: true,
           createdAt: true,
           updatedAt: true,
         },
@@ -364,7 +380,11 @@ describe('PaymentService', () => {
       expect(result.hasPrev).toBe(false);
       expect(mockPrisma.tip.findMany).toHaveBeenCalledWith(
         expect.objectContaining({
-          where: { creatorId, status: 'completed' },
+          where: {
+            creatorId,
+            status: 'completed',
+            moderationState: 'visible',
+          },
           skip: 0,
           take: 20,
         })
