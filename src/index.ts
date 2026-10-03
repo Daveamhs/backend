@@ -39,6 +39,7 @@ import { registerWebhookRoutes } from './domains/webhooks/webhook.routes';
 import { registerIncomingWebhookRoutes } from './domains/webhooks/webhook-incoming.routes';
 import { registerAnalyticsRoutes } from './domains/analytics/analytics.routes';
 import { registerAdminRoutes } from './domains/admin/admin.routes';
+import { registerMediaRoutes } from './domains/media/media.routes';
 import { registerModerationRoutes } from './domains/moderation/moderation.routes';
 import { registerRoleRoutes } from './domains/roles/role.routes';
 import { registerNotificationRoutes } from './domains/notifications/notification.routes';
@@ -132,6 +133,7 @@ registerAnalyticsRoutes(app, prisma);
 registerNotificationRoutes(app, prisma);
 registerAdminRoutes(app, prisma);
 registerRoleRoutes(app, prisma);
+registerMediaRoutes(app, prisma);
 registerModerationRoutes(app, prisma);
 registerMetricsRoute(app, prisma);
 registerReportRoutes(app, prisma);
@@ -294,6 +296,7 @@ const bootstrap = async (): Promise<void> => {
   registerAnalyticsRoutes(app, prisma);
   registerAdminRoutes(app, prisma);
 registerRoleRoutes(app, prisma);
+registerMediaRoutes(app, prisma);
 registerModerationRoutes(app, prisma);
   registerMetricsRoute(app, prisma);
   registerQueryPerformanceRoutes(app);
@@ -317,9 +320,9 @@ const start = async (): Promise<void> => {
 
     startRedisHealthCheck();
 
-    if (config.ENABLE_WORKERS || config.JOBS_WORKERS_ENABLED) {
+if (config.ENABLE_WORKERS || config.JOBS_WORKERS_ENABLED) {
       const { startWorkers } = await import('./lib/workers/index');
-      startWorkers().catch((err) => {
+      startWorkers(prisma).catch((err) => {
         app.log.error({ err }, 'Failed to start background workers');
       });
     }

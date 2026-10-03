@@ -252,10 +252,11 @@ model Tip {
   // returns the original tip instead of creating a duplicate charge.
   idempotencyKey  String? @unique
 
+// Tip message media (#64): images and short videos uploaded before the tip.
+  media TipMedia[]
   // Moderation state (#62): read paths only serve 'visible' rows, an open report
   // can hide content while it is reviewed, and a resolved decision can remove it.
   moderationState String @default("visible") // visible, hidden, removed
-
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -622,6 +623,65 @@ model Payout {
   // Retry worker: failed payouts ordered by next retry time.
   @@index([status, nextRetryAt], map: "idx_payout_status_nextRetryAt")
   @@index([transactionHash])
+}
+// Media attached to tip messages (#64). The row exists before the bytes do (it is
+// the upload reservation), becomes `ready` once the file has been verified and
+// scanned, and is attached to a tip by setting `tipId` at tip creation time.
+model TipMedia {
+  id     String @id @default(cuid())
+  userId String
+
+  // Set when the media is attached to a tip; only `ready` media can be attached.
+  tipId String?
+  tip   Tip?    @relation(fields: [tipId], references: [id], onDelete: Cascade)
+
+  kind   String // image, video
+  status String @default("pending") // pending, uploaded, scanning, ready, rejected, failed
+
+  mimeType   String
+  fileName   String
+  storageKey String @unique
+  sizeBytes  Int    @default(0)
+
+  width           Int?
+  height          Int?
+  durationSeconds Float?
+  // Derived renditions (preview/optimized/thumbnail) with their keys and sizes.
+  derivatives     Json    @default("[]")
+
+  processingStatus String  @default("pending") // pending, done, skipped, failed
+  processingError  String?
+
+  scanner         String?
+  scanSignature   String?
+  scanCompletedAt DateTime?
+
+  uploadedAt DateTime?
+  attachedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // A user's own uploads, newest first, filtered by status.
+  @@index([userId, status, createdAt(sort: Desc)], map: "idx_tipMedia_user_status_createdAt")
+  // Media for a tip, in attachment order.
+  @@index([tipId, attachedAt], map: "idx_tipMedia_tip_attachedAt")
+  // Sweep for uploads that were reserved but never completed.
+  @@index([status, createdAt], map: "idx_tipMedia_status_createdAt")
+}
+
+// Per-user storage quota (#64). `usedBytes` counts verified media; uploads that
+// are still in flight are counted separately as reserved.
+model MediaQuota {
+  id     String @id @default(cuid())
+  userId String @unique
+
+  usedBytes  Int @default(0)
+  fileCount  Int @default(0)
+  limitBytes Int
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }
 // ---------------------------------------------------------------------------
 // Team / organization support (#66)
