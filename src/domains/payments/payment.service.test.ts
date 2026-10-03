@@ -327,6 +327,28 @@ describe('PaymentService', () => {
           moderationState: true,
           createdAt: true,
           updatedAt: true,
+          media: {
+            where: { status: 'ready' },
+            orderBy: { attachedAt: 'asc' },
+            select: {
+              id: true,
+              kind: true,
+              status: true,
+              mimeType: true,
+              fileName: true,
+              sizeBytes: true,
+              width: true,
+              height: true,
+              durationSeconds: true,
+              storageKey: true,
+              derivatives: true,
+              processingStatus: true,
+              processingError: true,
+              tipId: true,
+              attachedAt: true,
+              createdAt: true,
+            },
+          },
         },
       });
     });

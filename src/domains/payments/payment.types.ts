@@ -1,4 +1,6 @@
 import { z } from 'zod';
+import { MAX_MEDIA_PER_TIP as MAX_TIP_MEDIA } from '../media/media.types';
+import type { MediaView } from '../media/media.types';
 
 /**
  * Tip Status enum representing the lifecycle of a tip transaction
@@ -31,7 +33,15 @@ export const CreateTipSchema = z.object({
    * instead of creating (and charging for) a duplicate.
    */
   idempotencyKey: z.string().trim().min(8).max(255).optional(),
-  assetId: z.string().trim().min(1).max(100).optional(),
+assetId: z.string().trim().min(1).max(100).optional(),
+  /**
+   * IDs of previously uploaded media to attach to this tip's message. Each id
+   * must reference media owned by the tipper that finished scanning (`ready`).
+   */
+  mediaIds: z
+    .array(z.string().min(1, 'Media ID is required'))
+    .max(MAX_TIP_MEDIA, `A tip can carry at most ${MAX_TIP_MEDIA} media items`)
+    .optional(),
 });
 
 /**
@@ -82,6 +92,8 @@ export interface TipResponse {
   message: string | null;
   status: TipStatusType;
   transactionHash: string | null;
+  /** Verified media attached to the tip message (#64), in attachment order. */
+  media: MediaView[];
   createdAt: string;
   updatedAt: string;
   assetCode: string;

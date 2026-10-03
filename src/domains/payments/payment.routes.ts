@@ -43,6 +43,42 @@ const tipFilterOptions = (query: TipHistoryQueryInput) => ({
   creatorId: query.creatorId,
 });
 
+/**
+ * Media attached to a tip message (#64), in attachment order.
+ *
+ * This has to be spelled out: the 201 schema below is a fast-json-stringify
+ * schema, so any property it does not declare is stripped from the response and
+ * the client would never see the media it just attached.
+ */
+const tipMediaResponseSchema = {
+  type: 'array',
+  items: {
+    type: 'object',
+    properties: {
+      id: { type: 'string' },
+      kind: { type: 'string' },
+      status: { type: 'string' },
+      mimeType: { type: 'string' },
+      fileName: { type: 'string' },
+      sizeBytes: { type: 'number' },
+      width: { type: ['number', 'null'] },
+      height: { type: ['number', 'null'] },
+      durationSeconds: { type: ['number', 'null'] },
+      url: { type: 'string' },
+      previewUrl: { type: ['string', 'null'] },
+      thumbnailUrl: { type: ['string', 'null'] },
+      processing: {
+        type: 'object',
+        properties: {
+          status: { type: 'string' },
+          error: { type: ['string', 'null'] },
+        },
+      },
+      createdAt: { type: 'string' },
+      attachedTipId: { type: ['string', 'null'] },
+    },
+  },
+} as const;
 export const registerPaymentRoutes = (app: FastifyInstance, prisma: PrismaClient): void => {
   const paymentService = new PaymentService(prisma);
 
@@ -71,6 +107,7 @@ export const registerPaymentRoutes = (app: FastifyInstance, prisma: PrismaClient
                   amount: { type: 'number' },
                   status: { type: 'string' },
                   createdAt: { type: 'string' },
+                  media: tipMediaResponseSchema,
                 },
               },
             },
