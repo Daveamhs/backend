@@ -6,6 +6,7 @@ import { bullConnection, backoffStrategy, moveToDeadLetter, QUEUE_NAMES } from '
 import { config } from '../../config/env';
 import { logger } from '../../utils/logger';
 import { executeWithBreaker, CircuitBreakerOpenError } from '../circuit-breaker';
+import { requestIdHeaders } from '../requestContext';
 
 const prisma = new PrismaClient();
 
@@ -41,7 +42,7 @@ export function createWebhookDispatchWorker() {
             'X-Dorisio-Signature': `sha256=${signature}`,
             'X-Dorisio-Event': eventType,
             'X-Dorisio-Delivery-Id': job.id,
-            'X-Request-Id': String(job.data.requestId ?? job.id),
+            ...requestIdHeaders(String(job.data.requestId ?? job.id)),
           },
           timeout: 10_000,
           validateStatus: () => true,

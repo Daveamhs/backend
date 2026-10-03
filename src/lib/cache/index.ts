@@ -12,6 +12,8 @@ type CacheOptions = { ttlMs?: number; prefix?: string };
 export enum CacheType {
   USER = 'user',
   CREATOR = 'creator',
+  TIPS = 'tips',
+  EARNINGS = 'earnings',
   TRENDING = 'trending',
   ANALYTICS = 'analytics',
 }
@@ -20,8 +22,12 @@ export enum CacheType {
 export const TTL_CONFIG: Record<CacheType, number> = {
   [CacheType.USER]: 5 * 60 * 1000, // 5 minutes
   [CacheType.CREATOR]: 10 * 60 * 1000, // 10 minutes
+  [CacheType.TIPS]: 5 * 60 * 1000,
+  [CacheType.EARNINGS]: 60 * 1000,
   [CacheType.TRENDING]: 1 * 60 * 1000, // 1 minute
-  [CacheType.ANALYTICS]: 60 * 60 * 1000, // 1 hour
+  // Kept at the legacy cache-aside TTL for compatibility; analytics writes
+  // always invalidate immediately and invalidation policy caps fresh entries.
+  [CacheType.ANALYTICS]: 60 * 60 * 1000,
 };
 
 const memoryCache = new LRUCache<string, any>({

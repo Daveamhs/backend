@@ -3,7 +3,7 @@ import { config } from '../../config/env';
 import { isFeatureEnabled } from '../../config/features';
 import { logger } from '../../utils/logger';
 
-export type EmailTemplate = 'verification' | 'password-reset' | 'creator-verification' | 'notification';
+export type EmailTemplate = 'verification' | 'password-reset' | 'creator-verification' | 'account-locked' | 'notification';
 
 export interface EmailNotification {
   to: string;
@@ -61,6 +61,9 @@ export function renderEmail(template: EmailTemplate, data: Record<string, string
     const status = escape(data.status ?? 'updated');
     const reason = data.reason ? `<p>Review note: ${escape(data.reason)}</p>` : '';
     return { subject: `Creator verification ${status}`, html: `<p>Hello ${name},</p><p>Your creator verification request was ${status}.</p>${reason}` };
+  }
+  if (template === 'account-locked') {
+    return { subject: 'Your Dorisio account was temporarily locked', html: `<p>Hello ${name},</p><p>We detected repeated failed login attempts. Your account is temporarily locked until ${escape(data.unlockAt ?? 'later')}.</p>` };
   }
   return { subject: escape(data.subject ?? 'Dorisio notification'), html: `<p>Hello ${name},</p><p>${escape(data.message ?? '')}</p>` };
 }

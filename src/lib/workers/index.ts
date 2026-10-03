@@ -1,3 +1,4 @@
+import type { PrismaClient } from '@prisma/client';
 import { config } from '../../config/env';
 import { logger } from '../../utils/logger';
 import { CRON_PRESETS, scheduleJob } from '../jobs/scheduler';
@@ -22,12 +23,16 @@ async function registerScheduledJobs(): Promise<void> {
   });
 }
 
-export async function startWorkers() {
+/**
+ * Start the worker pool. `prisma` is forwarded to the workers that need database
+ * access (media processing); workers that only touch Redis or Stellar ignore it.
+ */
+export async function startWorkers(prisma?: PrismaClient) {
   const workers = [
     createStellarConfirmationWorker(),
     createWebhookDispatchWorker(),
     createEmailWorker(),
-    createImageProcessingWorker(),
+    createImageProcessingWorker(prisma),
     createAnalyticsWorker(),
     createExportsWorker(),
   ];

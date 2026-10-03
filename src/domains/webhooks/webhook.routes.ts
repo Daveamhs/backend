@@ -125,6 +125,66 @@ export const registerWebhookRoutes = (app: FastifyInstance, prisma: PrismaClient
     }
   );
 
+  // POST /api/v1/webhooks/:id/rotate-secret - Rotate webhook secret
+  app.post<{ Params: { id: string } }>(
+    '/api/v1/webhooks/:id/rotate-secret',
+    {
+      preHandler: authMiddleware,
+      schema: {
+        description: 'Rotate webhook secret. The previous secret will remain valid for 7 days.',
+        params: {
+          type: 'object',
+          properties: {
+            id: { type: 'string', description: 'Webhook ID' },
+          },
+        },
+        response: {
+          200: { description: 'Secret rotated successfully' },
+          401: { description: 'Unauthorized' },
+          404: { description: 'Webhook not found' },
+        },
+      } as any,
+    },
+    async (request: FastifyRequest, reply: FastifyReply) => {
+      try {
+        const user = request.user;
+        if (!user) throw new Error('User not found');
+
+        const creator = await prisma.creator.findUnique({
+          where: { userId: user.userId },
+          select: { id: true },
+        });
+
+        if (!creator) {
+          reply.code(404).send(formatError('Creator not found', 'CREATOR_NOT_FOUND'));
+          return;
+        }
+
+        const { id } = request.params as { id: string };
+        const result = await webhookService.rotateWebhookSecret(
+          id,
+          creator.id,
+          user.userId,
+          request.ip
+        );
+        reply.send(
+          formatSuccess({
+            webhook: result,
+            message: 'Webhook secret rotated. Previous secret will remain valid for 7 days.',
+          })
+        );
+      } catch (error) {
+        if (error instanceof ValidationError) {
+          reply.code(400).send(formatError(error.message, error.code));
+        } else if (error instanceof AppError) {
+          reply.code(error.statusCode).send(formatError(error.message, error.code));
+        } else {
+          throw error;
+        }
+      }
+    }
+  );
+
   // DELETE /api/v1/webhooks/:id - Delete webhook
   app.delete<{ Params: { id: string } }>(
     '/api/v1/webhooks/:id',
